@@ -13,8 +13,28 @@
 #ifndef GPS_UART_BAUD
 #define GPS_UART_BAUD 9600  // docelowa predkosc UART
 #endif
-#ifndef GPS_RATE_HZ
+// Jeden przelacznik GPS_MODE = czestotliwosc + systemy satelitarne (limity u-blox M10,
+// 25 i 20 Hz wymagaja trybu high performance - GEP-M10 ma go fabrycznie):
+//   25 - 25 Hz, sam GPS            (najwiecej punktow, najmniej satelitow)
+//   20 - 20 Hz, GPS + Galileo      (kompromis)
+//   10 - 10 Hz, GPS+Galileo+BeiDou+QZSS (najwiecej satelitow, najlepszy HDOP)
+#ifndef GPS_MODE
+#define GPS_MODE 10
+#endif
+#if GPS_MODE == 25
+#define GPS_RATE_HZ 25
+constexpr uint32_t kUseGalileo = 0, kUseBeidou = 0;
+constexpr const char* kModeName = "GPS";
+#elif GPS_MODE == 20
+#define GPS_RATE_HZ 20
+constexpr uint32_t kUseGalileo = 1, kUseBeidou = 0;
+constexpr const char* kModeName = "GPS+Galileo";
+#elif GPS_MODE == 10
 #define GPS_RATE_HZ 10
+constexpr uint32_t kUseGalileo = 1, kUseBeidou = 1;
+constexpr const char* kModeName = "GPS+Galileo+BeiDou+QZSS";
+#else
+#error "GPS_MODE musi byc 25, 20 albo 10"
 #endif
 
 namespace gpsrx {
@@ -36,6 +56,7 @@ volatile uint8_t tracked = 0;     // satelity z sygnalem (SNR > 0) z ostatniego 
 volatile uint32_t trackedMs = 0;
 uint8_t trackedAcc = 0;
 bool gsvPending = false;
+uint32_t rmcCount = 0;  // licznik pomiarow (do debugu: rzeczywista czestotliwosc)
 
 bool checksumOk(const char* s) {
   const char* star = strchr(s, '*');
@@ -70,7 +91,9 @@ bool processLine(const char* s) {
   }
   if (!checksumOk(s)) return !isGsv;
 
-  if (strncmp(type, "GGA", 3) == 0) {
+  if (strncmp(type, "RMC", 3) == 0) {
+    rmcCount++;  // jedno RMC na pomiar
+  } else if (strncmp(type, "GGA", 3) == 0) {
     const char* q = field(s, 6);
     if (q) ggaQuality = (uint8_t)atoi(q);
   } else if (isGsv) {
@@ -134,6 +157,11 @@ constexpr uint32_t CFG_MSGOUT_NMEA_GLL_UART1 = 0x209100ca;
 constexpr uint32_t CFG_MSGOUT_NMEA_GSA_UART1 = 0x209100c0;
 constexpr uint32_t CFG_MSGOUT_NMEA_GSV_UART1 = 0x209100c5;
 constexpr uint32_t CFG_MSGOUT_NMEA_VTG_UART1 = 0x209100b1;
+// L, wlaczenie systemow satelitarnych
+constexpr uint32_t CFG_SIGNAL_GAL_ENA = 0x10310021;
+constexpr uint32_t CFG_SIGNAL_BDS_ENA = 0x10310022;
+constexpr uint32_t CFG_SIGNAL_QZSS_ENA = 0x10310024;
+constexpr uint32_t CFG_SIGNAL_GLO_ENA = 0x10310025;
 
 struct KeyVal {
   uint32_t key;
@@ -210,6 +238,18 @@ void configureModule() {
   };
   ackCount = 0;
   nakCount = 0;
+  // Systemy satelitarne wg GPS_MODE - zawsze wysylane w calosci, bo modul pamieta poprzedni
+  // tryb do odciecia zasilania (sam reset ESP go nie czysci). GPS i SBAS zostaja wlaczone.
+  // Zmiana systemow restartuje odbiornik GNSS - dlatego wysylana pierwsza.
+  const KeyVal signals[] = {
+      {CFG_SIGNAL_GAL_ENA, kUseGalileo},
+      {CFG_SIGNAL_BDS_ENA, kUseBeidou},
+      {CFG_SIGNAL_QZSS_ENA, kUseBeidou},  // QZSS (wzmocnienie GPS) razem z pelnym zestawem
+      {CFG_SIGNAL_GLO_ENA, 0},
+  };
+  sendValset(signals, sizeof(signals) / sizeof(signals[0]));
+  Serial2.flush();
+  delay(200);
   sendValset(settings, sizeof(settings) / sizeof(settings[0]));
   Serial2.flush();
   delay(50);
@@ -221,7 +261,8 @@ void configureModule() {
   delay(100);
   Serial2.updateBaudRate(GPS_UART_BAUD);
 
-  Serial.printf("[GPS] u-blox M10: %d Hz, automotive, RMC+GGA, %d bps\n", GPS_RATE_HZ, GPS_UART_BAUD);
+  Serial.printf("[GPS] u-blox M10: %d Hz (%s), automotive, RMC+GGA, %d bps\n", GPS_RATE_HZ, kModeName,
+                GPS_UART_BAUD);
   cfg = Cfg::Verify;
   windowStartMs = millis();
   passedAtStart = gps.passedChecksum();
@@ -278,8 +319,9 @@ void debugStep() {
   uint32_t passed = gps.passedChecksum();
   uint32_t failed = gps.failedChecksum();
   Quality q = quality();
-  Serial.printf("[GPS] %lu bps | %lu B/s | NMEA ok %lu, zle %lu | sat %u/%u hdop %.1f q%u | %s",
-                (unsigned long)Serial2.baudRate(), (unsigned long)dbgChars,
+  static uint32_t lastRmc = 0;
+  Serial.printf("[GPS] %lu Hz | %lu bps | %lu B/s | NMEA ok %lu, zle %lu | sat %u/%u hdop %.1f q%u | %s",
+                (unsigned long)(rmcCount - lastRmc), (unsigned long)Serial2.baudRate(), (unsigned long)dbgChars,
                 (unsigned long)(passed - dbgLastPassed), (unsigned long)(failed - dbgLastFailed),
                 q.used, q.tracked, q.hdop, q.fix,
                 dbgChars == 0 ? "BRAK DANYCH" : (gps.location.isValid() ? "FIX" : "brak fixa"));
@@ -287,6 +329,7 @@ void debugStep() {
     Serial.printf(" %.6f,%.6f %.1f km/h", gps.location.lat(), gps.location.lng(), gps.speed.kmph());
   Serial.println();
   if (dbgLine[0]) Serial.printf("[GPS]   ostatnia linia: %s\n", dbgLine);
+  lastRmc = rmcCount;
   dbgChars = 0;
   dbgLine[0] = '\0';
   dbgLastPassed = passed;
