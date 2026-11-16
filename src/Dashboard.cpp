@@ -9,7 +9,7 @@
 
 // Uklad 240x320 (pionowo). Delty i czasy duze, rozmiar dopasowany do panelu:
 //  +--------------------------+
-//  | o GPS SD   145 km/h      |  0..23    status + predkosc
+//  | o GPS SD 145 km/h 14 sat 0.8 |  0..23 status + predkosc + jakosc GPS (sat, HDOP)
 //  +--------------------------+
 //  |            +3            |  24..81   delta predkosci [km/h]
 //  | [=======|             ]  |           + pasek
@@ -137,9 +137,27 @@ void drawStatus(const DashData& d) {
   bool showGps = d.gpsState != 0;
   bool showSd = d.sdState != 0;
 
+  // Prawy rog: jakosc GPS. Przed fixem - ile satelitow juz slychac (szary, liczba rosnie),
+  // z fixem - satelity uzyte + HDOP: zielony dobry, zolty sredni, czerwony slaby.
+  char gq[16] = "";
+  char gqShort[8] = "";
+  uint16_t gqCol = COL_LABEL;
+  if (d.gpsState == 2) {
+    snprintf(gq, sizeof(gq), "%u sat", d.gpsTracked);
+  } else if (d.gpsState == 3) {
+    snprintf(gqShort, sizeof(gqShort), "%u sat", d.gpsSats);
+    if (d.gpsHdopX10 > 0)
+      snprintf(gq, sizeof(gq), "%u sat %d.%d", d.gpsSats, d.gpsHdopX10 / 10, d.gpsHdopX10 % 10);
+    else
+      snprintf(gq, sizeof(gq), "%s", gqShort);
+    bool bad = d.gpsSats < 6 || d.gpsHdopX10 == 0 || d.gpsHdopX10 > 25;
+    bool good = d.gpsSats >= 10 && d.gpsHdopX10 > 0 && d.gpsHdopX10 <= 12;
+    gqCol = good ? COL_GREEN : (bad ? COL_RED : COL_YELLOW);
+  }
+
   char key[64];
-  snprintf(key, sizeof(key), "%u|%s|%u|%u|%u|%d%d", (unsigned)dot, mid, (unsigned)midCol, (unsigned)gpsCol,
-           (unsigned)sdCol, showGps, showSd);
+  snprintf(key, sizeof(key), "%u|%s|%u|%u|%u|%d%d|%s|%u", (unsigned)dot, mid, (unsigned)midCol, (unsigned)gpsCol,
+           (unsigned)sdCol, showGps, showSd, gq, (unsigned)gqCol);
   if (!changed(pStatus, key)) return;
 
   auto& s = *pStatus.spr;
@@ -158,6 +176,14 @@ void drawStatus(const DashData& d) {
   s.setTextColor(midCol);
   s.setTextDatum(middle_center);
   s.drawString(mid, 126, 12);
+  if (gq[0]) {
+    // gdy pelny napis wchodzilby na srodkowy tekst - bez HDOP
+    const int midRight = 126 + s.textWidth(mid) / 2;
+    const char* txt = (236 - s.textWidth(gq) < midRight + 6 && gqShort[0]) ? gqShort : gq;
+    s.setTextColor(gqCol);
+    s.setTextDatum(middle_right);
+    s.drawString(txt, 236, 12);
+  }
   push(pStatus);
 }
 

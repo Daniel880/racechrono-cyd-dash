@@ -29,6 +29,9 @@ struct DashData {
   bool hasDeltaSpeed;
   int32_t deltaSpeedKmhX10;  // + = szybciej niz okrazenie porownawcze
   int8_t gpsState;  // gpsrx::State: 0 brak modulu, 1 brak danych, 2 brak fixa, 3 fix
+  uint8_t gpsSats;      // satelity uzyte w fixie
+  uint8_t gpsTracked;   // satelity z sygnalem (przed fixem)
+  int16_t gpsHdopX10;   // 0 = brak
   int8_t sdState;   // gpx::State: 0 wylaczone, -1 blad, 1 czeka na fix, 2 zapis
 };
 

@@ -30,6 +30,10 @@ static void readValues(DashData& d) {
   d.hasLastLapNumber = rc::get(rc::LAST_LAP_NUMBER, d.lastLapNumber);
   d.hasDeltaSpeed = rc::get(rc::DELTA_SPEED, d.deltaSpeedKmhX10);
   d.gpsState = (int8_t)gpsrx::state();
+  gpsrx::Quality q = gpsrx::quality();
+  d.gpsSats = q.used;
+  d.gpsTracked = q.tracked;
+  d.gpsHdopX10 = (int16_t)lroundf(min(q.hdop, 99.9f) * 10.0f);
   d.sdState = (int8_t)gpx::state();
 }
 

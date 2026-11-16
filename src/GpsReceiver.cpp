@@ -29,6 +29,65 @@ size_t lineLen = 0;
 uint32_t lastCharMs = 0;
 uint32_t lastEpoch = 0xFFFFFFFF;  // czas ostatnio wyslanej pozycji (hhmmsscc)
 
+// ---------- Wlasne parsowanie: jakosc fixa z GGA, satelity z sygnalem z GSV ----------
+constexpr uint32_t kTrackedMaxAgeMs = 3000;
+volatile uint8_t ggaQuality = 0;  // pole 6 GGA: 0 brak, 1 GPS, 2 DGPS/SBAS, 4/5 RTK, 6 DR
+volatile uint8_t tracked = 0;     // satelity z sygnalem (SNR > 0) z ostatniego kompletu GSV
+volatile uint32_t trackedMs = 0;
+uint8_t trackedAcc = 0;
+bool gsvPending = false;
+
+bool checksumOk(const char* s) {
+  const char* star = strchr(s, '*');
+  if (!star || !star[1] || !star[2]) return false;
+  uint8_t ck = 0;
+  for (const char* p = s + 1; p < star; p++) ck ^= (uint8_t)*p;
+  return ck == (uint8_t)strtoul(star + 1, nullptr, 16);
+}
+
+// Poczatek pola n (0 = "$GNGGA"); pole konczy sie na ',' albo '*'. nullptr = brak pola.
+const char* field(const char* s, int n) {
+  for (; n > 0; n--) {
+    s = strpbrk(s, ",*");
+    if (!s || *s == '*') return nullptr;
+    s++;
+  }
+  return s;
+}
+
+// Zwraca true, gdy linia ma trafic do backupu na SD (GSV sluzy tylko wskaznikowi na ekranie).
+bool processLine(const char* s) {
+  if (s[0] != '$' || strlen(s) < 6) return false;
+  const char* type = s + 3;  // po "$GN"
+  const bool isGsv = strncmp(type, "GSV", 3) == 0;
+
+  // Komplet GSV (wszystkie systemy, wiele linii) konczy sie na pierwszej linii innego typu.
+  if (!isGsv && gsvPending) {
+    tracked = trackedAcc;
+    trackedMs = millis();
+    trackedAcc = 0;
+    gsvPending = false;
+  }
+  if (!checksumOk(s)) return !isGsv;
+
+  if (strncmp(type, "GGA", 3) == 0) {
+    const char* q = field(s, 6);
+    if (q) ggaQuality = (uint8_t)atoi(q);
+  } else if (isGsv) {
+    // $xxGSV,liczbaLinii,nrLinii,satWidocznych,{prn,elew,azym,snr} x <=4[,signalId]*cs
+    const char* nr = field(s, 2);
+    const char* inView = field(s, 3);
+    if (!nr || !inView) return false;
+    int inThisLine = atoi(inView) - (atoi(nr) - 1) * 4;
+    for (int i = 0; i < 4 && i < inThisLine; i++) {
+      const char* snr = field(s, 7 + 4 * i);
+      if (snr && atoi(snr) > 0 && trackedAcc < 255) trackedAcc++;
+    }
+    gsvPending = true;
+  }
+  return !isGsv;
+}
+
 #ifdef GPS_UBLOX_M10
 // ---------- Autokonfiguracja u-blox M10 (UBX-CFG-VALSET) ----------
 // Stan: szukamy predkosci UART -> konfigurujemy -> przechodzimy na GPS_UART_BAUD -> praca.
@@ -43,6 +102,27 @@ Cfg cfg = Cfg::Detect;
 size_t baudIdx = 0;
 uint32_t windowStartMs = 0;
 uint32_t passedAtStart = 0;
+
+// Odpowiedzi modulu na UBX-CFG-VALSET: UBX-ACK-ACK / UBX-ACK-NAK
+uint32_t ackCount = 0;
+uint32_t nakCount = 0;
+uint8_t ubxTail[8] = {};
+
+// Szuka w strumieniu (NMEA i UBX wymieszane) ramki B5 62 05 0x 02 00 06 8A.
+void ubxScan(uint8_t c) {
+  memmove(ubxTail, ubxTail + 1, sizeof(ubxTail) - 1);
+  ubxTail[sizeof(ubxTail) - 1] = c;
+  if (ubxTail[0] != 0xB5 || ubxTail[1] != 0x62 || ubxTail[2] != 0x05 || ubxTail[4] != 0x02 ||
+      ubxTail[5] != 0x00 || ubxTail[6] != 0x06 || ubxTail[7] != 0x8A)
+    return;
+  if (ubxTail[3] == 0x01) {
+    ackCount++;
+    Serial.println("[GPS] modul potwierdzil konfiguracje (UBX-ACK-ACK)");
+  } else if (ubxTail[3] == 0x00) {
+    nakCount++;
+    Serial.println("[GPS] modul ODRZUCIL konfiguracje (UBX-ACK-NAK)");
+  }
+}
 
 // Klucze konfiguracji M10 (u-blox M10 Interface Description)
 constexpr uint32_t CFG_RATE_MEAS = 0x30210001;          // U2, okres pomiaru [ms]
@@ -124,9 +204,12 @@ void configureModule() {
       {CFG_MSGOUT_NMEA_RMC_UART1, 1},
       {CFG_MSGOUT_NMEA_GLL_UART1, 0},
       {CFG_MSGOUT_NMEA_GSA_UART1, 0},
-      {CFG_MSGOUT_NMEA_GSV_UART1, 0},
+      // GSV raz na sekunde (co GPS_RATE_HZ pomiarow): ile satelitow slychac jeszcze przed fixem
+      {CFG_MSGOUT_NMEA_GSV_UART1, GPS_RATE_HZ},
       {CFG_MSGOUT_NMEA_VTG_UART1, 0},
   };
+  ackCount = 0;
+  nakCount = 0;
   sendValset(settings, sizeof(settings) / sizeof(settings[0]));
   Serial2.flush();
   delay(50);
@@ -158,7 +241,13 @@ void autoConfigStep() {
     case Cfg::Verify:
       if (gps.passedChecksum() - passedAtStart >= 2) {
         cfg = Cfg::Run;
-        Serial.println("[GPS] konfiguracja OK");
+        if (nakCount > 0)
+          Serial.printf("[GPS] UWAGA: NAK x%lu - modul nie przyjal ustawien\n", (unsigned long)nakCount);
+        else if (ackCount == 0)
+          Serial.println("[GPS] UWAGA: brak ACK - komendy nie dochodza do modulu, "
+                         "sprawdz przewod IO22 -> RX modulu");
+        else
+          Serial.printf("[GPS] konfiguracja OK (ACK x%lu)\n", (unsigned long)ackCount);
       } else if (now - windowStartMs > kVerifyTimeoutMs) {
         Serial.println("[GPS] brak danych po konfiguracji, szukam od nowa");
         startDetect(0);
@@ -173,6 +262,37 @@ void autoConfigStep() {
   }
 }
 #endif  // GPS_UBLOX_M10
+
+#ifdef GPS_DEBUG
+// Co sekunde: ile bajtow i zdan NMEA przyszlo, stan fixa i ostatnia linia.
+uint32_t dbgChars = 0;
+uint32_t dbgLastMs = 0;
+uint32_t dbgLastPassed = 0;
+uint32_t dbgLastFailed = 0;
+char dbgLine[sizeof(line)] = "";
+
+void debugStep() {
+  uint32_t now = millis();
+  if (now - dbgLastMs < 1000) return;
+  dbgLastMs = now;
+  uint32_t passed = gps.passedChecksum();
+  uint32_t failed = gps.failedChecksum();
+  Quality q = quality();
+  Serial.printf("[GPS] %lu bps | %lu B/s | NMEA ok %lu, zle %lu | sat %u/%u hdop %.1f q%u | %s",
+                (unsigned long)Serial2.baudRate(), (unsigned long)dbgChars,
+                (unsigned long)(passed - dbgLastPassed), (unsigned long)(failed - dbgLastFailed),
+                q.used, q.tracked, q.hdop, q.fix,
+                dbgChars == 0 ? "BRAK DANYCH" : (gps.location.isValid() ? "FIX" : "brak fixa"));
+  if (gps.location.isValid())
+    Serial.printf(" %.6f,%.6f %.1f km/h", gps.location.lat(), gps.location.lng(), gps.speed.kmph());
+  Serial.println();
+  if (dbgLine[0]) Serial.printf("[GPS]   ostatnia linia: %s\n", dbgLine);
+  dbgChars = 0;
+  dbgLine[0] = '\0';
+  dbgLastPassed = passed;
+  dbgLastFailed = failed;
+}
+#endif  // GPS_DEBUG
 
 }  // namespace
 
@@ -193,12 +313,21 @@ bool update(rc::GpsFix& out) {
     char c = (char)Serial2.read();
     lastCharMs = millis();
     gps.encode(c);
+#ifdef GPS_DEBUG
+    dbgChars++;
+#endif
+#ifdef GPS_UBLOX_M10
+    ubxScan((uint8_t)c);
+#endif
 
     // Surowe linie NMEA do backupu
     if (c == '\n' || c == '\r') {
       if (lineLen > 0) {
         line[lineLen] = '\0';
-        if (line[0] == '$') gpx::nmeaLine(line);
+        if (processLine(line)) gpx::nmeaLine(line);
+#ifdef GPS_DEBUG
+        memcpy(dbgLine, line, lineLen + 1);
+#endif
         lineLen = 0;
       }
     } else if (lineLen < sizeof(line) - 1) {
@@ -206,6 +335,9 @@ bool update(rc::GpsFix& out) {
     }
   }
 
+#ifdef GPS_DEBUG
+  debugStep();
+#endif
 #ifdef GPS_UBLOX_M10
   autoConfigStep();
   if (cfg != Cfg::Run) return false;
@@ -231,7 +363,9 @@ bool update(rc::GpsFix& out) {
   out.speedKmh = gps.speed.isValid() ? (float)gps.speed.kmph() : 0.0f;
   out.bearingDeg = gps.course.isValid() ? (float)gps.course.deg() : 0.0f;
   out.satellites = gps.satellites.isValid() ? (uint8_t)min<uint32_t>(gps.satellites.value(), 62) : 0;
-  out.fixQuality = 1;
+  // RaceChrono: 1 = GPS, 2 = z korekcja (SBAS/EGNOS, DGPS, RTK)
+  uint8_t q = ggaQuality;
+  out.fixQuality = (q == 2 || q == 4 || q == 5) ? 2 : 1;
   out.hdop = gps.hdop.isValid() ? (float)gps.hdop.hdop() : 9.9f;
   out.vdop = out.hdop;
   return true;
@@ -246,6 +380,16 @@ State state() {
   return State::Fix;
 }
 
+Quality quality() {
+  Quality r{};
+  bool fresh = gps.location.isValid() && gps.location.age() <= kMaxFixAgeMs;
+  if (fresh && gps.satellites.isValid()) r.used = (uint8_t)min<uint32_t>(gps.satellites.value(), 255);
+  if (fresh && gps.hdop.isValid()) r.hdop = (float)gps.hdop.hdop();
+  if (millis() - trackedMs <= kTrackedMaxAgeMs) r.tracked = tracked;
+  r.fix = ggaQuality;
+  return r;
+}
+
 }  // namespace gpsrx
 
 #else  // bez GPS_UART_RX: brak modulu
@@ -254,6 +398,7 @@ namespace gpsrx {
 void begin() {}
 bool update(rc::GpsFix&) { return false; }
 State state() { return State::Off; }
+Quality quality() { return {}; }
 }  // namespace gpsrx
 
 #endif
