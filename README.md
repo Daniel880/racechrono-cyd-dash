@@ -115,3 +115,25 @@ Urzadzenie rozglasza sie przez BLE jako `RC DIY CYD` (nazwe mozna zmienic na str
 RaceChrono rozpoznaje urzadzenie po usludze BLE, nie po nazwie). Po polaczeniu z RaceChrono samo rejestruje
 potrzebne monitory (kropka na pasku stanu robi sie zielona). Zeby RaceChrono korzystalo z pozycji
 z modulu GPS, wybierz to urzadzenie w RaceChrono jako zrodlo GPS.
+
+## Obudowa
+
+Dwuczesciowa obudowa do druku 3D (na tasme do poprzeczki kierownicy motocykla), 110 x 57.8 x 25 mm:
+
+- `enclosure/stl/przod.stl` - ekran, GPS (antena wystaje przez okno), szczelina karty SD;
+  drukowac ekranem do stolu,
+- `enclosure/stl/tyl.stl` - bateria 104050 i modul ladowania (prowadnice do wklejenia),
+  przelacznik, gniazdo USB-C ladowania; drukowac plecami do stolu,
+- pliki `.step` do edycji w CAD, podglad: `enclosure/podglad.png`, `enclosure/podglad_rozlozona.png`.
+
+Polowki lacza sie na wpust (pioro 1.1 mm, luz 0.1 mm), wszystkie otwory sa na prawym boku.
+Zalecany PETG (PLA na sloncu sie odksztalca).
+
+Model jest generowany skryptem `enclosure/obudowa.py` ([build123d](https://github.com/gumyr/build123d)) -
+wszystkie wymiary sa na gorze pliku:
+
+    pip install build123d
+    python3 enclosure/obudowa.py
+
+Opcje w skrypcie: `SUPPORTS = True` - zeberka podporowe w otworach (do wylamania po druku),
+`TPU_COVER = True` - zaslepka z TPU na SD i USB-C (`zaslepka_tpu.stl`) z otworem na jej trzpien.
