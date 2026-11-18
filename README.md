@@ -95,14 +95,7 @@ programu; po zapisie wyswietlacz sie restartuje.
      potem Upload).
 3. Na ekranie widac postep, po wgraniu wyswietlacz sam sie restartuje.
 
-Haslo sieci i wgrywania: sekcja `[ota]` w pliku `ota_secret.ini` (poza gitem), np.
-
-```
-[ota]
-password = twoje-haslo
-```
-
-Bez tego pliku obowiazuje haslo domyslne z `platformio.ini`. Pierwsze wgranie po przejsciu na
+Haslo sieci i wgrywania: `12345678` (sekcja `[ota]` w `platformio.ini`). Pierwsze wgranie po przejsciu na
 dwie partycje aplikacji (`min_spiffs.csv`) musi byc przez USB (srodowisko `cyd`). Jesli wgrywanie
 nie startuje, sprawdz zapore na laptopie - wyswietlacz laczy sie zwrotnie z laptopem po TCP.
 
