@@ -13,32 +13,29 @@
 #ifndef GPS_UART_BAUD
 #define GPS_UART_BAUD 9600  // docelowa predkosc UART
 #endif
-// Jeden przelacznik GPS_MODE = czestotliwosc + systemy satelitarne (limity u-blox M10,
-// 25 i 20 Hz wymagaja trybu high performance - GEP-M10 ma go fabrycznie):
-//   25 - 25 Hz, sam GPS            (najwiecej punktow, najmniej satelitow)
-//   20 - 20 Hz, GPS + Galileo      (kompromis)
-//   10 - 10 Hz, GPS+Galileo+BeiDou+QZSS (najwiecej satelitow, najlepszy HDOP)
-#ifndef GPS_MODE
-#define GPS_MODE 10
-#endif
-#if GPS_MODE == 25
-#define GPS_RATE_HZ 25
-constexpr uint32_t kUseGalileo = 0, kUseBeidou = 0;
-constexpr const char* kModeName = "GPS";
-#elif GPS_MODE == 20
-#define GPS_RATE_HZ 20
-constexpr uint32_t kUseGalileo = 1, kUseBeidou = 0;
-constexpr const char* kModeName = "GPS+Galileo";
-#elif GPS_MODE == 10
-#define GPS_RATE_HZ 10
-constexpr uint32_t kUseGalileo = 1, kUseBeidou = 1;
-constexpr const char* kModeName = "GPS+Galileo+BeiDou+QZSS";
-#else
-#error "GPS_MODE musi byc 25, 20 albo 10"
-#endif
-
 namespace gpsrx {
 namespace {
+
+// Tryb GPS = czestotliwosc + systemy satelitarne (limity u-blox M10, 25 i 20 Hz wymagaja trybu
+// high performance - GEP-M10 ma go fabrycznie). Wybierany na stronie WiFi (Settings).
+struct Mode {
+  uint8_t hz;
+  uint32_t galileo, beidou;  // 1 = wlaczony (BeiDou razem z QZSS)
+  const char* name;
+};
+
+Mode modeFor(uint8_t m) {
+  switch (m) {
+    case 25:
+      return {25, 0, 0, "GPS"};  // najwiecej punktow, najmniej satelitow
+    case 10:
+      return {10, 1, 1, "GPS+Galileo+BeiDou+QZSS"};  // najwiecej satelitow, najlepszy HDOP
+    default:
+      return {20, 1, 0, "GPS+Galileo"};  // kompromis
+  }
+}
+
+Mode mode = modeFor(20);
 
 constexpr uint32_t kNoDataTimeoutMs = 3000;
 constexpr uint32_t kMaxFixAgeMs = 1500;
@@ -46,17 +43,31 @@ constexpr uint32_t kMaxFixAgeMs = 1500;
 TinyGPSPlus gps;
 char line[128];
 size_t lineLen = 0;
-uint32_t lastCharMs = 0;
+uint32_t lastValidMs = 0;         // ostatnie zdanie NMEA z poprawna suma kontrolna (0 = jeszcze zadne)
 uint32_t lastEpoch = 0xFFFFFFFF;  // czas ostatnio wyslanej pozycji (hhmmsscc)
 
 // ---------- Wlasne parsowanie: jakosc fixa z GGA, satelity z sygnalem z GSV ----------
 constexpr uint32_t kTrackedMaxAgeMs = 3000;
-volatile uint8_t ggaQuality = 0;  // pole 6 GGA: 0 brak, 1 GPS, 2 DGPS/SBAS, 4/5 RTK, 6 DR
-volatile uint8_t tracked = 0;     // satelity z sygnalem (SNR > 0) z ostatniego kompletu GSV
-volatile uint32_t trackedMs = 0;
+uint8_t ggaQuality = 0;  // pole 6 GGA: 0 brak, 1 GPS, 2 DGPS/SBAS, 4/5 RTK, 6 DR
+uint8_t tracked = 0;     // satelity z sygnalem (SNR > 0) z ostatniego kompletu GSV
+uint32_t trackedMs = 0;
 uint8_t trackedAcc = 0;
 bool gsvPending = false;
-uint32_t rmcCount = 0;  // licznik pomiarow (do debugu: rzeczywista czestotliwosc)
+uint32_t rmcCount = 0;  // licznik pomiarow (rzeczywista czestotliwosc: kontrola modulu i debug)
+// Satelity uzyte w fixie z GNS (zakres 0-99, raz na sekunde) - w GGA to pole ma limit 12.
+constexpr uint32_t kGnsMaxAgeMs = 2500;
+uint8_t gnsSats = 0;
+uint32_t gnsMs = 0;
+// Szacowany blad pozycji poziomej z GST (raz na sekunde): odbiornik liczy go z jakosci pomiarow,
+// wiec - inaczej niz HDOP (sama geometria satelitow) - widac w nim tez slaby sygnal i odbicia.
+float gstAccM = 0.0f;
+uint32_t gstMs = 0;
+
+// Wszystko powyzej (razem z TinyGPS++) zmienia i czyta tylko zadanie GPS. Ekran (inne zadanie)
+// dostaje stan i jakosc przez te kopie, odswiezane w kazdym update().
+volatile State stateSnap = State::NoData;
+volatile uint8_t qUsed = 0, qTracked = 0, qFix = 0;
+volatile float qHdop = 0.0f, qAcc = 0.0f;
 
 bool checksumOk(const char* s) {
   const char* star = strchr(s, '*');
@@ -96,6 +107,24 @@ bool processLine(const char* s) {
   } else if (strncmp(type, "GGA", 3) == 0) {
     const char* q = field(s, 6);
     if (q) ggaQuality = (uint8_t)atoi(q);
+  } else if (strncmp(type, "GNS", 3) == 0) {
+    // $xxGNS,time,lat,NS,lon,EW,posMode,numSV,... - tylko linia z pozycja (laczne rozwiazanie);
+    // przy kilku systemach moga dojsc linie z satelitami pojedynczego systemu i pusta pozycja.
+    const char* lat = field(s, 2);
+    const char* n = field(s, 7);
+    if (lat && *lat != ',' && n && *n >= '0' && *n <= '9') {
+      gnsSats = (uint8_t)min(atoi(n), 255);
+      gnsMs = millis();
+    }
+  } else if (strncmp(type, "GST", 3) == 0) {
+    // $xxGST,time,rangeRms,stdMajor,stdMinor,orient,stdLat,stdLong,stdAlt - odchylenia w metrach
+    const char* la = field(s, 6);
+    const char* lo = field(s, 7);
+    if (la && lo && *la >= '0' && *la <= '9' && *lo >= '0' && *lo <= '9') {
+      const float a = (float)atof(la), b = (float)atof(lo);
+      gstAccM = sqrtf(a * a + b * b);
+      gstMs = millis();
+    }
   } else if (isGsv) {
     // $xxGSV,liczbaLinii,nrLinii,satWidocznych,{prn,elew,azym,snr} x <=4[,signalId]*cs
     const char* nr = field(s, 2);
@@ -111,20 +140,39 @@ bool processLine(const char* s) {
   return !isGsv;
 }
 
+// Satelity uzyte w fixie: ze swiezego GNS (bez limitu 12), inaczej z GGA.
+uint32_t usedSats() {
+  if (gnsMs != 0 && millis() - gnsMs <= kGnsMaxAgeMs) return gnsSats;
+  return gps.satellites.isValid() ? gps.satellites.value() : 0;
+}
+
+void feed(char c);  // nizej - wolane takze w trakcie konfiguracji modulu
+
 #ifdef GPS_UBLOX_M10
 // ---------- Autokonfiguracja u-blox M10 (UBX-CFG-VALSET) ----------
 // Stan: szukamy predkosci UART -> konfigurujemy -> przechodzimy na GPS_UART_BAUD -> praca.
-// Po utracie danych (odlaczenie / reset modulu) wszystko od nowa.
+// W pracy pilnujemy, czy z modulu dalej plyna poprawne zdania z zadana czestotliwoscia.
+// Gdy nie (odlaczenie, reset modulu do ustawien fabrycznych) - wszystko od nowa.
 enum class Cfg : uint8_t { Detect, Verify, Run };
 constexpr uint32_t kBauds[] = {115200, 38400, 9600, 57600, 230400};
 constexpr size_t kBaudCount = sizeof(kBauds) / sizeof(kBauds[0]);
 constexpr uint32_t kDetectWindowMs = 1200;
 constexpr uint32_t kVerifyTimeoutMs = 2500;
+constexpr uint32_t kRetryCfgMs = 30000;  // modul nie odpowiadal na komendy: kolejna proba po tym czasie
+constexpr uint8_t kLowRateSecs = 3;      // tyle sekund ponizej polowy zadanej czestotliwosci = reset modulu
 
 Cfg cfg = Cfg::Detect;
 size_t baudIdx = 0;
 uint32_t windowStartMs = 0;
 uint32_t passedAtStart = 0;
+bool cfgUnanswered = false;  // modul nie odpowiedzial na ostatnia konfiguracje
+uint32_t cfgAttemptMs = 0;
+
+// Kontrola czestotliwosci w pracy
+uint32_t rateWindowMs = 0;
+uint32_t rateRmcAtStart = 0;
+bool rateReached = false;  // modul osiagnal juz co najmniej polowe zadanej czestotliwosci
+uint8_t lowRateSecs = 0;
 
 // Odpowiedzi modulu na UBX-CFG-VALSET: UBX-ACK-ACK / UBX-ACK-NAK
 uint32_t ackCount = 0;
@@ -154,6 +202,8 @@ constexpr uint32_t CFG_UART1_BAUDRATE = 0x40520001;     // U4
 constexpr uint32_t CFG_MSGOUT_NMEA_GGA_UART1 = 0x209100bb;
 constexpr uint32_t CFG_MSGOUT_NMEA_RMC_UART1 = 0x209100ac;
 constexpr uint32_t CFG_MSGOUT_NMEA_GLL_UART1 = 0x209100ca;
+constexpr uint32_t CFG_MSGOUT_NMEA_GNS_UART1 = 0x209100b6;
+constexpr uint32_t CFG_MSGOUT_NMEA_GST_UART1 = 0x209100d4;
 constexpr uint32_t CFG_MSGOUT_NMEA_GSA_UART1 = 0x209100c0;
 constexpr uint32_t CFG_MSGOUT_NMEA_GSV_UART1 = 0x209100c5;
 constexpr uint32_t CFG_MSGOUT_NMEA_VTG_UART1 = 0x209100b1;
@@ -216,6 +266,28 @@ void sendValset(const KeyVal* kv, size_t count) {
   Serial2.write(msg, n);
 }
 
+// Czeka ms milisekund, caly czas przetwarzajac dane z modulu: odpowiedzi ACK/NAK sa znane
+// przed decyzja o zmianie predkosci, a zdania NMEA nie przepadaja.
+void pump(uint32_t ms) {
+  const uint32_t start = millis();
+  do {
+    while (Serial2.available()) feed((char)Serial2.read());
+    delay(1);
+  } while (millis() - start < ms);
+}
+
+// Czeka na odpowiedz ACK/NAK na ostatnia komende (najwyzej ms), przetwarzajac dane z modulu.
+bool waitAck(uint32_t ms) {
+  const uint32_t before = ackCount + nakCount;
+  const uint32_t start = millis();
+  do {
+    while (Serial2.available()) feed((char)Serial2.read());
+    if (ackCount + nakCount != before) return true;
+    delay(1);
+  } while (millis() - start < ms);
+  return false;
+}
+
 void startDetect(size_t idx) {
   baudIdx = idx % kBaudCount;
   Serial2.updateBaudRate(kBauds[baudIdx]);
@@ -224,45 +296,84 @@ void startDetect(size_t idx) {
   passedAtStart = gps.passedChecksum();
 }
 
+void enterRun() {
+  cfg = Cfg::Run;
+  rateWindowMs = millis();
+  rateRmcAtStart = rmcCount;
+  rateReached = false;
+  lowRateSecs = 0;
+}
+
 void configureModule() {
   const KeyVal settings[] = {
-      {CFG_RATE_MEAS, 1000 / GPS_RATE_HZ},
+      {CFG_RATE_MEAS, 1000u / mode.hz},
       {CFG_NAVSPG_DYNMODEL, 4},
       {CFG_MSGOUT_NMEA_GGA_UART1, 1},
       {CFG_MSGOUT_NMEA_RMC_UART1, 1},
       {CFG_MSGOUT_NMEA_GLL_UART1, 0},
       {CFG_MSGOUT_NMEA_GSA_UART1, 0},
-      // GSV raz na sekunde (co GPS_RATE_HZ pomiarow): ile satelitow slychac jeszcze przed fixem
-      {CFG_MSGOUT_NMEA_GSV_UART1, GPS_RATE_HZ},
+      // GSV raz na sekunde (co mode.hz pomiarow): ile satelitow slychac (diagnostyka)
+      {CFG_MSGOUT_NMEA_GSV_UART1, mode.hz},
       {CFG_MSGOUT_NMEA_VTG_UART1, 0},
   };
   ackCount = 0;
   nakCount = 0;
-  // Systemy satelitarne wg GPS_MODE - zawsze wysylane w calosci, bo modul pamieta poprzedni
+  cfgAttemptMs = millis();
+  // Systemy satelitarne wg trybu - zawsze wysylane w calosci, bo modul pamieta poprzedni
   // tryb do odciecia zasilania (sam reset ESP go nie czysci). GPS i SBAS zostaja wlaczone.
-  // Zmiana systemow restartuje odbiornik GNSS - dlatego wysylana pierwsza.
+  // Zmiana systemow restartuje odbiornik GNSS - dlatego wysylana pierwsza, a potem wg u-blox:
+  // czekamy na ACK i jeszcze 0.5 s, zanim pojdzie nastepna komenda.
   const KeyVal signals[] = {
-      {CFG_SIGNAL_GAL_ENA, kUseGalileo},
-      {CFG_SIGNAL_BDS_ENA, kUseBeidou},
-      {CFG_SIGNAL_QZSS_ENA, kUseBeidou},  // QZSS (wzmocnienie GPS) razem z pelnym zestawem
+      {CFG_SIGNAL_GAL_ENA, mode.galileo},
+      {CFG_SIGNAL_BDS_ENA, mode.beidou},
+      {CFG_SIGNAL_QZSS_ENA, mode.beidou},  // QZSS (wzmocnienie GPS) razem z pelnym zestawem
       {CFG_SIGNAL_GLO_ENA, 0},
   };
   sendValset(signals, sizeof(signals) / sizeof(signals[0]));
   Serial2.flush();
-  delay(200);
+  waitAck(1500);
+  pump(500);
   sendValset(settings, sizeof(settings) / sizeof(settings[0]));
   Serial2.flush();
-  delay(50);
+  waitAck(500);
+  // GNS i GST raz na sekunde: prawdziwa liczba uzytych satelitow i szacowana dokladnosc.
+  // Osobno - gdyby modul ich nie przyjal, odrzuci tylko je, a nie cala konfiguracje powyzej.
+  const KeyVal extra[] = {{CFG_MSGOUT_NMEA_GNS_UART1, mode.hz}, {CFG_MSGOUT_NMEA_GST_UART1, mode.hz}};
+  sendValset(extra, sizeof(extra) / sizeof(extra[0]));
+  Serial2.flush();
+  waitAck(500);
 
-  // Zmiana predkosci na koncu: modul przelacza sie od razu, my za nim.
+  // Zadnej odpowiedzi = modul nas nie slyszy (przewod IO22 -> RX modulu). Zmiana predkosci
+  // odcielaby wtedy takze odbior, wiec zostajemy na wykrytej predkosci i ustawieniach modulu
+  // (zwykle 1 Hz) - lepsze to niz nic - i ponawiamy konfiguracje co kRetryCfgMs.
+  if (ackCount == 0 && nakCount == 0) {
+    if (!cfgUnanswered)
+      Serial.printf("[GPS] UWAGA: modul nie odpowiada na komendy - sprawdz przewod IO22 -> RX modulu. "
+                    "Zostaje na %lu bps i ustawieniach modulu, ponawiam co %lu s\n",
+                    (unsigned long)kBauds[baudIdx], (unsigned long)(kRetryCfgMs / 1000));
+    cfgUnanswered = true;
+    enterRun();
+    return;
+  }
+  cfgUnanswered = false;
+
+  // Zmiana predkosci na koncu: modul przelacza sie od razu, my za nim - chyba ze ja odrzucil.
+  const uint32_t nakBefore = nakCount;
   const KeyVal baud[] = {{CFG_UART1_BAUDRATE, GPS_UART_BAUD}};
   sendValset(baud, 1);
   Serial2.flush();
-  delay(100);
-  Serial2.updateBaudRate(GPS_UART_BAUD);
+  pump(100);
+  const bool switched = nakCount == nakBefore;
+  if (switched) {
+    Serial2.updateBaudRate(GPS_UART_BAUD);
+    // Resztki odebrane jeszcze na starej predkosci nie moga zaliczyc weryfikacji nowej.
+    while (Serial2.available()) Serial2.read();
+    lineLen = 0;
+  }
 
-  Serial.printf("[GPS] u-blox M10: %d Hz (%s), automotive, RMC+GGA, %d bps\n", GPS_RATE_HZ, kModeName,
-                GPS_UART_BAUD);
+  Serial.printf("[GPS] u-blox M10: %u Hz (%s), automotive, RMC+GGA, %lu bps%s\n", mode.hz, mode.name,
+                (unsigned long)(switched ? GPS_UART_BAUD : kBauds[baudIdx]),
+                switched ? "" : " (modul odrzucil zmiane predkosci)");
   cfg = Cfg::Verify;
   windowStartMs = millis();
   passedAtStart = gps.passedChecksum();
@@ -281,12 +392,9 @@ void autoConfigStep() {
       break;
     case Cfg::Verify:
       if (gps.passedChecksum() - passedAtStart >= 2) {
-        cfg = Cfg::Run;
+        enterRun();
         if (nakCount > 0)
-          Serial.printf("[GPS] UWAGA: NAK x%lu - modul nie przyjal ustawien\n", (unsigned long)nakCount);
-        else if (ackCount == 0)
-          Serial.println("[GPS] UWAGA: brak ACK - komendy nie dochodza do modulu, "
-                         "sprawdz przewod IO22 -> RX modulu");
+          Serial.printf("[GPS] UWAGA: NAK x%lu - modul nie przyjal czesci ustawien\n", (unsigned long)nakCount);
         else
           Serial.printf("[GPS] konfiguracja OK (ACK x%lu)\n", (unsigned long)ackCount);
       } else if (now - windowStartMs > kVerifyTimeoutMs) {
@@ -295,10 +403,33 @@ void autoConfigStep() {
       }
       break;
     case Cfg::Run:
-      if (now - lastCharMs > kNoDataTimeoutMs) {
-        Serial.println("[GPS] utrata danych z modulu, szukam od nowa");
+      // Liczy sie tylko poprawne zdanie: przy niezgodnej predkosci UART (np. modul po resecie
+      // wrocil na fabryczna) bajty dalej przychodza, tylko ze to smieci.
+      if (now - lastValidMs > kNoDataTimeoutMs) {
+        Serial.println("[GPS] brak poprawnych danych z modulu, szukam od nowa");
         startDetect(0);
+        break;
       }
+      if (now - rateWindowMs >= 1000) {
+        // Reset modulu (np. chwilowy brak zasilania) przywraca ustawienia fabryczne, zwykle 1 Hz,
+        // a przy tej samej predkosci UART dane dalej wygladaja poprawnie. Liczy sie tylko spadek
+        // po osiagnieciu zadanej czestotliwosci - modul, ktory jej nie osiaga, nie wpadnie w petle.
+        const uint32_t hz = rmcCount - rateRmcAtStart;
+        rateRmcAtStart = rmcCount;
+        rateWindowMs = now;
+        const bool rateOk = hz * 2 >= mode.hz;
+        if (rateOk) rateReached = true;
+        lowRateSecs = (rateReached && !rateOk) ? lowRateSecs + 1 : 0;
+        if (lowRateSecs >= kLowRateSecs) {
+          Serial.printf("[GPS] czestotliwosc spadla do %lu Hz (reset modulu?), konfiguruje od nowa\n",
+                        (unsigned long)hz);
+          startDetect(0);
+          break;
+        }
+      }
+      // Modul nas nie slyszal: ponawiamy, ale tylko gdy nie nadaje z zadana czestotliwoscia
+      // (konfiguracja wstrzymuje wysylke pozycji na ~350 ms - bez potrzeby szkoda punktow).
+      if (cfgUnanswered && !rateReached && now - cfgAttemptMs >= kRetryCfgMs) configureModule();
       break;
   }
 }
@@ -320,10 +451,10 @@ void debugStep() {
   uint32_t failed = gps.failedChecksum();
   Quality q = quality();
   static uint32_t lastRmc = 0;
-  Serial.printf("[GPS] %lu Hz | %lu bps | %lu B/s | NMEA ok %lu, zle %lu | sat %u/%u hdop %.1f q%u | %s",
+  Serial.printf("[GPS] %lu Hz | %lu bps | %lu B/s | NMEA ok %lu, zle %lu | sat %u/%u hdop %.1f blad %.1fm q%u | %s",
                 (unsigned long)(rmcCount - lastRmc), (unsigned long)Serial2.baudRate(), (unsigned long)dbgChars,
                 (unsigned long)(passed - dbgLastPassed), (unsigned long)(failed - dbgLastFailed),
-                q.used, q.tracked, q.hdop, q.fix,
+                q.used, q.tracked, q.hdop, q.accM, q.fix,
                 dbgChars == 0 ? "BRAK DANYCH" : (gps.location.isValid() ? "FIX" : "brak fixa"));
   if (gps.location.isValid())
     Serial.printf(" %.6f,%.6f %.1f km/h", gps.location.lat(), gps.location.lng(), gps.speed.kmph());
@@ -337,9 +468,55 @@ void debugStep() {
 }
 #endif  // GPS_DEBUG
 
+// Jeden bajt z modulu: TinyGPS++, odpowiedzi UBX i wlasne parsowanie linii NMEA (+ backup na SD).
+void feed(char c) {
+  if (gps.encode(c)) lastValidMs = millis();  // true = zdanie z poprawna suma kontrolna
+#ifdef GPS_DEBUG
+  dbgChars++;
+#endif
+#ifdef GPS_UBLOX_M10
+  ubxScan((uint8_t)c);
+#endif
+
+  // Surowe linie NMEA do backupu
+  if (c == '\n' || c == '\r') {
+    if (lineLen > 0) {
+      line[lineLen] = '\0';
+      if (processLine(line)) gpx::nmeaLine(line);
+#ifdef GPS_DEBUG
+      memcpy(dbgLine, line, lineLen + 1);
+#endif
+      lineLen = 0;
+    }
+  } else if (lineLen < sizeof(line) - 1) {
+    line[lineLen++] = c;
+  }
+}
+
+// Kopia stanu i jakosci dla ekranu (patrz stateSnap).
+void publish() {
+  const uint32_t now = millis();
+  const bool fresh = gps.location.isValid() && gps.location.age() <= kMaxFixAgeMs;
+  State s = State::Fix;
+  if (lastValidMs == 0 || now - lastValidMs > kNoDataTimeoutMs) s = State::NoData;
+#ifdef GPS_UBLOX_M10
+  else if (cfg != Cfg::Run) s = State::NoData;
+#endif
+  else if (!fresh) s = State::NoFix;
+  stateSnap = s;
+
+  // Satelity uzyte w rozwiazaniu - takze przed fixem (wtedy zwykle 0-3), bez "slyszanych".
+  qUsed = (s == State::NoData) ? 0 : (uint8_t)min<uint32_t>(usedSats(), 255);
+  qHdop = (fresh && gps.hdop.isValid()) ? (float)gps.hdop.hdop() : 0.0f;
+  qAcc = (fresh && gstMs != 0 && now - gstMs <= kGnsMaxAgeMs) ? gstAccM : 0.0f;
+  qTracked = (now - trackedMs <= kTrackedMaxAgeMs) ? tracked : 0;
+  qFix = ggaQuality;
+}
+
 }  // namespace
 
-void begin() {
+void begin(uint8_t gpsMode) {
+  mode = modeFor(gpsMode);
   Serial2.setRxBufferSize(2048);
 #ifdef GPS_UBLOX_M10
   Serial2.begin(kBauds[0], SERIAL_8N1, GPS_UART_RX, GPS_UART_TX);
@@ -352,37 +529,16 @@ void begin() {
 }
 
 bool update(rc::GpsFix& out) {
-  while (Serial2.available()) {
-    char c = (char)Serial2.read();
-    lastCharMs = millis();
-    gps.encode(c);
-#ifdef GPS_DEBUG
-    dbgChars++;
-#endif
+  while (Serial2.available()) feed((char)Serial2.read());
+
 #ifdef GPS_UBLOX_M10
-    ubxScan((uint8_t)c);
+  autoConfigStep();
 #endif
-
-    // Surowe linie NMEA do backupu
-    if (c == '\n' || c == '\r') {
-      if (lineLen > 0) {
-        line[lineLen] = '\0';
-        if (processLine(line)) gpx::nmeaLine(line);
-#ifdef GPS_DEBUG
-        memcpy(dbgLine, line, lineLen + 1);
-#endif
-        lineLen = 0;
-      }
-    } else if (lineLen < sizeof(line) - 1) {
-      line[lineLen++] = c;
-    }
-  }
-
+  publish();
 #ifdef GPS_DEBUG
   debugStep();
 #endif
 #ifdef GPS_UBLOX_M10
-  autoConfigStep();
   if (cfg != Cfg::Run) return false;
 #endif
 
@@ -390,7 +546,10 @@ bool update(rc::GpsFix& out) {
   if (!gps.time.isUpdated() || !gps.location.isValid() || !gps.date.isValid()) return false;
   uint32_t epoch = gps.time.value();
   if (epoch == lastEpoch) return false;
-  if (gps.location.age() > kMaxFixAgeMs) return false;
+  // TinyGPS++ zatwierdza czas z kazdego RMC/GGA, a pozycje, predkosc i kurs tylko z fixem
+  // (a location.isValid() po pierwszym fixie juz nie wraca do false). Po utracie fixa czas
+  // idzie dalej, a pozycja stoi - taka "zamrozona" pozycja z nowym czasem nie moze isc dalej.
+  if (gps.location.age() > gps.time.age()) return false;
   lastEpoch = epoch;
 
   out.year = gps.date.year();
@@ -405,7 +564,7 @@ bool update(rc::GpsFix& out) {
   out.altM = gps.altitude.isValid() ? (float)gps.altitude.meters() : 0.0f;
   out.speedKmh = gps.speed.isValid() ? (float)gps.speed.kmph() : 0.0f;
   out.bearingDeg = gps.course.isValid() ? (float)gps.course.deg() : 0.0f;
-  out.satellites = gps.satellites.isValid() ? (uint8_t)min<uint32_t>(gps.satellites.value(), 62) : 0;
+  out.satellites = (uint8_t)min<uint32_t>(usedSats(), 62);  // RaceChrono: 6 bitow, 63 = brak
   // RaceChrono: 1 = GPS, 2 = z korekcja (SBAS/EGNOS, DGPS, RTK)
   uint8_t q = ggaQuality;
   out.fixQuality = (q == 2 || q == 4 || q == 5) ? 2 : 1;
@@ -414,31 +573,16 @@ bool update(rc::GpsFix& out) {
   return true;
 }
 
-State state() {
-  if (lastCharMs == 0 || millis() - lastCharMs > kNoDataTimeoutMs) return State::NoData;
-#ifdef GPS_UBLOX_M10
-  if (cfg != Cfg::Run) return State::NoData;
-#endif
-  if (!gps.location.isValid() || gps.location.age() > kMaxFixAgeMs) return State::NoFix;
-  return State::Fix;
-}
+State state() { return stateSnap; }
 
-Quality quality() {
-  Quality r{};
-  bool fresh = gps.location.isValid() && gps.location.age() <= kMaxFixAgeMs;
-  if (fresh && gps.satellites.isValid()) r.used = (uint8_t)min<uint32_t>(gps.satellites.value(), 255);
-  if (fresh && gps.hdop.isValid()) r.hdop = (float)gps.hdop.hdop();
-  if (millis() - trackedMs <= kTrackedMaxAgeMs) r.tracked = tracked;
-  r.fix = ggaQuality;
-  return r;
-}
+Quality quality() { return Quality{qUsed, qTracked, qHdop, qFix, qAcc}; }
 
 }  // namespace gpsrx
 
 #else  // bez GPS_UART_RX: brak modulu
 
 namespace gpsrx {
-void begin() {}
+void begin(uint8_t) {}
 bool update(rc::GpsFix&) { return false; }
 State state() { return State::Off; }
 Quality quality() { return {}; }

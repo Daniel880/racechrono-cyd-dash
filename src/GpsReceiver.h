@@ -16,10 +16,12 @@ struct Quality {
   uint8_t tracked;  // satelity z sygnalem (GSV) - rosnie juz przed fixem
   float hdop;       // 0 = brak
   uint8_t fix;      // pole 6 GGA: 0 brak, 1 GPS, 2 SBAS/DGPS
+  float accM;       // szacowany blad pozycji poziomej [m] z GST, 0 = brak
 };
 
-void begin();
-bool update(rc::GpsFix& out);  // true = nowa pozycja (jedna na epoke GPS)
+void begin(uint8_t gpsMode);  // 25 / 20 / 10 - patrz Settings.h
+bool update(rc::GpsFix& out);  // true = nowa pozycja (jedna na epoke GPS, tylko z aktualnym fixem)
+// Stan i jakosc sa liczone w update(), wiec mozna je czytac z innego zadania (ekran).
 State state();
 Quality quality();
 

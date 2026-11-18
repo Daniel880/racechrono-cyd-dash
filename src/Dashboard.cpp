@@ -55,7 +55,7 @@ LGFX_Sprite bigSpr;
 struct Panel {
   int16_t x, y, w, h;
   LGFX_Sprite* spr;
-  char key[64];  // co jest aktualnie narysowane
+  char key[80];  // co jest aktualnie narysowane
 };
 
 LGFX* lcd = nullptr;
@@ -89,6 +89,13 @@ bool changed(Panel& p, const char* key) {
 
 void push(Panel& p) { p.spr->pushSprite(lcd, p.x, p.y); }
 
+bool otaScreen = false;  // na ekranie jest postep wgrywania przez WiFi
+
+// Linie oddzielajace panele (1 px przerwy miedzy nimi).
+void drawSeparators() {
+  for (int y : {82, 141, 200, 259}) lcd->drawFastHLine(0, y, lcd->width(), COL_LINE);
+}
+
 void formatLapTime(char* out, size_t n, bool has, int32_t ms) {
   if (!has || ms < 0) {
     snprintf(out, n, "-:--.--");
@@ -110,6 +117,18 @@ void setBigFont(LGFX_Sprite& s, const lgfx::IFont& font, const char* text, int m
 }
 
 int32_t clampI(int32_t v, int32_t lim) { return v > lim ? lim : (v < -lim ? -lim : v); }
+
+// Ikona WiFi (srodek dolu w x, y): zolte luki = siec czeka na podlaczenie,
+// pelny zielony wachlarz = ktos jest podlaczony (mozna wgrywac).
+constexpr int kWifiX = 79, kWifiY = 19, kWifiR = 13;
+void drawWifiIcon(LGFX_Sprite& s, bool client) {
+  if (client) {
+    s.fillArc(kWifiX, kWifiY, 0, kWifiR, 225, 315, COL_GREEN);
+    return;
+  }
+  s.fillCircle(kWifiX, kWifiY, 2, COL_YELLOW);
+  for (int r : {5, 9, kWifiR}) s.fillArc(kWifiX, kWifiY, r - 1, r, 225, 315, COL_YELLOW);
+}
 
 void drawStatus(const DashData& d) {
   uint16_t dot = !d.connected ? COL_DIM : (!d.configured ? COL_YELLOW : COL_GREEN);
@@ -137,13 +156,18 @@ void drawStatus(const DashData& d) {
   bool showGps = d.gpsState != 0;
   bool showSd = d.sdState != 0;
 
-  // Prawy rog: jakosc GPS. Przed fixem - ile satelitow juz slychac (szary, liczba rosnie),
-  // z fixem - satelity uzyte + HDOP: zielony dobry, zolty sredni, czerwony slaby.
+  // Prawy rog: satelity uzyte w rozwiazaniu. Przed fixem szare (zwykle 0-3), z fixem + szacowany
+  // blad pozycji z GST (kolor: zielony < 2.5 m, zolty < 5 m, czerwony); bez GST - HDOP jak dawniej.
   char gq[16] = "";
   char gqShort[8] = "";
   uint16_t gqCol = COL_LABEL;
   if (d.gpsState == 2) {
-    snprintf(gq, sizeof(gq), "%u sat", d.gpsTracked);
+    snprintf(gq, sizeof(gq), "%u sat", d.gpsSats);
+  } else if (d.gpsState == 3 && d.gpsAccX10 > 0) {
+    const int a = d.gpsAccX10 > 999 ? 999 : d.gpsAccX10;
+    snprintf(gqShort, sizeof(gqShort), "%d.%dm", a / 10, a % 10);  // gdy brak miejsca - sam blad
+    snprintf(gq, sizeof(gq), "%u sat %s", d.gpsSats, gqShort);
+    gqCol = a < 25 ? COL_GREEN : (a < 50 ? COL_YELLOW : COL_RED);
   } else if (d.gpsState == 3) {
     snprintf(gqShort, sizeof(gqShort), "%u sat", d.gpsSats);
     if (d.gpsHdopX10 > 0)
@@ -155,9 +179,9 @@ void drawStatus(const DashData& d) {
     gqCol = good ? COL_GREEN : (bad ? COL_RED : COL_YELLOW);
   }
 
-  char key[64];
-  snprintf(key, sizeof(key), "%u|%s|%u|%u|%u|%d%d|%s|%u", (unsigned)dot, mid, (unsigned)midCol, (unsigned)gpsCol,
-           (unsigned)sdCol, showGps, showSd, gq, (unsigned)gqCol);
+  char key[80];
+  snprintf(key, sizeof(key), "%u|%s|%u|%u|%u|%d%d|%s|%u|%d", (unsigned)dot, mid, (unsigned)midCol,
+           (unsigned)gpsCol, (unsigned)sdCol, showGps, showSd, gq, (unsigned)gqCol, d.otaState);
   if (!changed(pStatus, key)) return;
 
   auto& s = *pStatus.spr;
@@ -173,12 +197,19 @@ void drawStatus(const DashData& d) {
     s.setTextColor(sdCol);
     s.drawString("SD", 50, 12);
   }
+  int midX = 126;
+  if (d.otaState > 0) {
+    drawWifiIcon(s, d.otaState >= 2);
+    // srodkowy napis przesuniety w prawo, gdy wchodzilby na ikone
+    const int minX = kWifiX + kWifiR + 4 + s.textWidth(mid) / 2;
+    if (midX < minX) midX = minX;
+  }
   s.setTextColor(midCol);
   s.setTextDatum(middle_center);
-  s.drawString(mid, 126, 12);
+  s.drawString(mid, midX, 12);
   if (gq[0]) {
     // gdy pelny napis wchodzilby na srodkowy tekst - bez HDOP
-    const int midRight = 126 + s.textWidth(mid) / 2;
+    const int midRight = midX + s.textWidth(mid) / 2;
     const char* txt = (236 - s.textWidth(gq) < midRight + 6 && gqShort[0]) ? gqShort : gq;
     s.setTextColor(gqCol);
     s.setTextDatum(middle_right);
@@ -298,11 +329,35 @@ void begin(LGFX& display) {
   createSpr(bigSpr, 240, kBigH, 16);
   Serial.printf("[UI] wolny RAM %u B, najwiekszy blok %u B\n", (unsigned)ESP.getFreeHeap(),
                 (unsigned)ESP.getMaxAllocHeap());
-  // linie oddzielajace panele (1 px przerwy miedzy nimi)
-  for (int y : {82, 141, 200, 259}) lcd->drawFastHLine(0, y, lcd->width(), COL_LINE);
+  drawSeparators();
+}
+
+void showOtaProgress(int percent) {
+  if (!otaScreen) {
+    otaScreen = true;
+    lcd->fillScreen(COL_BG);
+    lcd->setFont(&fonts::Font4);
+    lcd->setTextDatum(middle_center);
+    lcd->setTextColor(COL_TEXT, COL_BG);
+    lcd->drawString("Wgrywanie", 120, 120);
+    lcd->drawRect(18, 150, 204, 24, COL_LABEL);
+  }
+  lcd->fillRect(20, 152, 200 * percent / 100, 20, COL_GREEN);
+  char t[12];
+  snprintf(t, sizeof(t), "  %d%%  ", percent);  // spacje zamazuja dluzszy poprzedni napis
+  lcd->setFont(&fonts::Font4);
+  lcd->setTextDatum(middle_center);
+  lcd->setTextColor(COL_TEXT, COL_BG);
+  lcd->drawString(t, 120, 200);
 }
 
 void update(const DashData& d) {
+  if (otaScreen) {  // wgrywanie przerwane - zwykly ekran od nowa
+    otaScreen = false;
+    lcd->fillScreen(COL_BG);
+    drawSeparators();
+    for (Panel* p : {&pStatus, &pDeltaSpeed, &pDelta, &pCurrent, &pLast, &pBest}) p->key[0] = '\0';
+  }
   drawStatus(d);
   drawSpeedDelta(d);
   drawTimeDelta(d);

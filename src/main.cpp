@@ -3,16 +3,21 @@
 #include "Dashboard.h"
 #include "GpsReceiver.h"
 #include "GpxLogger.h"
+#include "OtaUpdate.h"
 #include "RaceChronoBle.h"
+#include "Settings.h"
 
 #ifdef SIM_GPS
 #include "GpsSim.h"
 #endif
 
+#if defined(SIM_GPS) && defined(GPS_UART_RX)
+#error "SIM_GPS razem z GPS_UART_RX: RaceChrono dostaloby pozycje z dwoch zrodel naraz - zostaw jedno"
+#endif
+
 #include "LGFX_CYD.h"
 static LGFX lcd;
 
-static constexpr const char* kDeviceName = "RC DIY CYD";
 static constexpr uint32_t kRefreshMs = 100;  // 10 Hz - tyle, ile wysyla RaceChrono
 
 static void readValues(DashData& d) {
@@ -32,9 +37,10 @@ static void readValues(DashData& d) {
   d.gpsState = (int8_t)gpsrx::state();
   gpsrx::Quality q = gpsrx::quality();
   d.gpsSats = q.used;
-  d.gpsTracked = q.tracked;
   d.gpsHdopX10 = (int16_t)lroundf(min(q.hdop, 99.9f) * 10.0f);
+  d.gpsAccX10 = (int16_t)lroundf(min(q.accM, 99.9f) * 10.0f);
   d.sdState = (int8_t)gpx::state();
+  d.otaState = (int8_t)ota::state();
 }
 
 // Pozycja z modulu GPS (lub symulatora): do RaceChrono i do kolejki zapisu na SD.
@@ -67,9 +73,11 @@ void setup() {
   lcd.setBrightness(255);
   dash::begin(lcd);
 
-  rc::begin(kDeviceName);
-  gpx::begin();    // backup na SD we wlasnym zadaniu (tylko z -DGPX_LOG)
-  gpsrx::begin();  // modul GPS na UART (tylko z -DGPS_UART_RX)
+  // nazwa Bluetooth i tryb GPS - ustawiane na stronie WiFi, zapisane w pamieci NVS
+  const settings::Settings cfg = settings::load();
+  rc::begin(cfg.btName);
+  gpx::begin();                // backup na SD we wlasnym zadaniu (tylko z -DGPX_LOG)
+  gpsrx::begin(cfg.gpsMode);  // modul GPS na UART (tylko z -DGPS_UART_RX)
 
 #ifdef SIM_GPS
   gpssim::begin();
@@ -78,11 +86,14 @@ void setup() {
   // GPS w osobnym zadaniu o wyzszym priorytecie niz loop(): rysowanie ekranu
   // i zapis na SD nie opozniaja wysylki pozycji do RaceChrono.
   xTaskCreatePinnedToCore(gpsTask, "gps", 8192, nullptr, 2, nullptr, ARDUINO_RUNNING_CORE);
+  // WiFi do wgrywania tylko przez chwile po starcie (tylko z -DOTA_WIFI), potem wylaczone.
+  ota::begin(dash::showOtaProgress);
   Serial.printf("[SYS] po starcie: wolny RAM %u B, najwiekszy blok %u B\n", (unsigned)ESP.getFreeHeap(),
                 (unsigned)ESP.getMaxAllocHeap());
 }
 
 void loop() {
+  ota::loop();
   rc::loop();
 
   static uint32_t lastDraw = 0;
