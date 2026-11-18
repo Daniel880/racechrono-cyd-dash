@@ -19,7 +19,8 @@ constexpr uint32_t kSdFreq = 20000000;
 
 constexpr const char* kDir = "/gpx";
 constexpr uint32_t kFlushEveryMs = 2000;  // zapis bufora na karte
-constexpr size_t kQueueBytes = 16384;     // ~3 s danych przy 10 Hz
+constexpr uint32_t kRetryMountMs = 5000;  // brak karty / blad zapisu: kolejna proba montowania
+constexpr size_t kQueueBytes = 16384;     // ~2.5 s danych przy 25 Hz (RMC + GGA + punkt na pomiar)
 
 const char kFooter[] = "</trkseg></trk></gpx>\n";
 
@@ -35,14 +36,43 @@ RingbufHandle_t queue = nullptr;
 volatile State st = State::Off;
 char baseName[40] = "";
 uint32_t lastFlushMs = 0;
+uint32_t lastMountMs = 0;
 volatile uint32_t dropped = 0;
+bool writeOk = true;  // false = ktorys zapis od ostatniego montowania karty sie nie udal
+
+// Zapis z kontrola: karta wyjeta, bez kontaktu (wibracje) albo pelna -> zapisano mniej bajtow.
+void put(File& f, const void* data, size_t len) {
+  if (writeOk && f.write((const uint8_t*)data, len) != len) writeOk = false;
+}
+void put(File& f, const char* s) { put(f, s, strlen(s)); }
 
 // GPX jest poprawny po kazdej paczce punktow: stopka na koncu, potem cofamy sie
 // przed nia, zeby nastepne punkty ja nadpisaly. Odciecie zasilania nie psuje pliku.
 void writeFooter() {
   size_t pos = gpxFile.position();
-  gpxFile.print(kFooter);
-  gpxFile.seek(pos);
+  put(gpxFile, kFooter);
+  if (writeOk && !gpxFile.seek(pos)) writeOk = false;
+}
+
+bool mount() {
+  if (!SD.begin(kSdCs, sdSpi, kSdFreq)) return false;
+  writeOk = true;
+  lastFlushMs = millis();
+  st = State::Waiting;
+  Serial.println("[GPX] karta SD OK, czekam na fix GPS");
+  return true;
+}
+
+// Blad karty: zamykamy pliki i odmontowujemy. Zadanie zapisu co kRetryMountMs probuje
+// zamontowac karte od nowa - po udanej probie nastepny fix zaczyna nowa pare plikow.
+void fail(const char* why) {
+  st = State::Error;  // najpierw: zadanie GPS przestaje dokladac do kolejki
+  Serial.printf("[GPX] %s - zapis zatrzymany, ponowna proba co %lu s\n", why,
+                (unsigned long)(kRetryMountMs / 1000));
+  gpxFile.close();
+  nmeaFile.close();
+  SD.end();
+  lastMountMs = millis();
 }
 
 // Nazwa z czasu pierwszego fixa (UTC), np. "2026-11-13_14-05-32"; przy kolizji "_2", "_3"...
@@ -62,18 +92,26 @@ bool openNewFiles(const rc::GpsFix& f) {
 
     gpxFile = SD.open(gpxPath, "w+");
     nmeaFile = SD.open(nmeaPath, FILE_WRITE);
-    if (!gpxFile || !nmeaFile) return false;
-
-    gpxFile.print(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        "<gpx version=\"1.1\" creator=\"RaceChrono CYD display\"\n"
-        " xmlns=\"http://www.topografix.com/GPX/1/1\"\n"
-        " xmlns:gpxtpx=\"http://www.garmin.com/xmlschemas/TrackPointExtension/v2\">\n"
-        "<trk><name>");
-    gpxFile.print(baseName);
-    gpxFile.print("</name><trkseg>\n");
-    writeFooter();
-    gpxFile.flush();
+    if (gpxFile && nmeaFile) {
+      put(gpxFile,
+          "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          "<gpx version=\"1.1\" creator=\"RaceChrono CYD display\"\n"
+          " xmlns=\"http://www.topografix.com/GPX/1/1\"\n"
+          " xmlns:gpxtpx=\"http://www.garmin.com/xmlschemas/TrackPointExtension/v2\">\n"
+          "<trk><name>");
+      put(gpxFile, baseName);
+      put(gpxFile, "</name><trkseg>\n");
+      writeFooter();
+      gpxFile.flush();
+    }
+    if (!gpxFile || !nmeaFile || !writeOk) {
+      // np. pelna karta - bez zostawiania pustych plikow po kazdej nieudanej probie
+      gpxFile.close();
+      nmeaFile.close();
+      SD.remove(gpxPath);
+      SD.remove(nmeaPath);
+      return false;
+    }
     Serial.printf("[GPX] zapis do %s i %s\n", gpxPath, nmeaPath);
     return true;
   }
@@ -92,8 +130,7 @@ void enqueue(ItemType type, const void* data, size_t len) {
 bool writeFix(const rc::GpsFix& f) {
   if (st == State::Waiting) {
     if (!openNewFiles(f)) {
-      Serial.println("[GPX] nie moge utworzyc plikow");
-      st = State::Error;
+      fail("nie moge utworzyc plikow");
       return false;
     }
     st = State::Logging;
@@ -110,7 +147,7 @@ bool writeFix(const rc::GpsFix& f) {
            "</gpxtpx:TrackPointExtension></extensions></trkpt>\n",
            f.lat, f.lon, f.altM, f.year, f.month, f.day, f.hour, f.minute, f.second, f.millis, f.satellites,
            f.hdop, f.speedKmh / 3.6f, f.bearingDeg);
-  gpxFile.print(buf);
+  put(gpxFile, buf);
   return true;
 }
 
@@ -123,14 +160,15 @@ void writeQueued() {
       memcpy(&f, item + 1, sizeof(f));
       if (writeFix(f)) newPoints = true;
     } else if (item[0] == ItemNmea && st == State::Logging) {
-      nmeaFile.write(item + 1, size - 1);
-      nmeaFile.print("\r\n");
+      put(nmeaFile, item + 1, size - 1);
+      put(nmeaFile, "\r\n", 2);
     }
     vRingbufferReturnItem(queue, item);
   }
+  if (st != State::Logging) return;
   if (newPoints) writeFooter();
 
-  if (st == State::Logging && millis() - lastFlushMs >= kFlushEveryMs) {
+  if (millis() - lastFlushMs >= kFlushEveryMs) {
     lastFlushMs = millis();
     gpxFile.flush();
     nmeaFile.flush();
@@ -139,29 +177,41 @@ void writeQueued() {
       dropped = 0;
     }
   }
+  if (!writeOk) fail("blad zapisu na karte");
 }
 
 void sdTask(void*) {
-  while (st == State::Waiting || st == State::Logging) {
-    writeQueued();
+  for (;;) {
+    if (st == State::Error) {
+      // Wpisy sprzed bledu sa juz nieaktualne (nowe w tym stanie nie trafiaja do kolejki).
+      size_t size;
+      while (void* item = xRingbufferReceive(queue, &size, 0)) vRingbufferReturnItem(queue, item);
+      if (millis() - lastMountMs >= kRetryMountMs) {
+        lastMountMs = millis();
+        mount();
+      }
+    } else {
+      writeQueued();
+    }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
-  vTaskDelete(nullptr);  // blad karty - koniec logowania
 }
 
 }  // namespace
 
 void begin() {
   sdSpi.begin(kSdSck, kSdMiso, kSdMosi, kSdCs);
-  if (!SD.begin(kSdCs, sdSpi, kSdFreq)) {
-    Serial.println("[GPX] brak karty SD");
+  queue = xRingbufferCreate(kQueueBytes, RINGBUF_TYPE_NOSPLIT);
+  if (!queue) {
+    Serial.println("[GPX] brak RAM na kolejke zapisu");
     st = State::Error;
     return;
   }
-  queue = xRingbufferCreate(kQueueBytes, RINGBUF_TYPE_NOSPLIT);
-  Serial.println("[GPX] karta SD OK, czekam na fix GPS");
-  st = State::Waiting;
-  lastFlushMs = millis();
+  if (!mount()) {
+    Serial.printf("[GPX] brak karty SD, sprawdzam co %lu s\n", (unsigned long)(kRetryMountMs / 1000));
+    st = State::Error;
+  }
+  lastMountMs = millis();
   // rdzen 0 (tam dziala tez BLE), niski priorytet; ekran i GPS sa na rdzeniu 1
   xTaskCreatePinnedToCore(sdTask, "sd", 6144, nullptr, 1, nullptr, 0);
 }

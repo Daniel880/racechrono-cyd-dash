@@ -54,8 +54,7 @@ volatile bool connected = false;
 volatile bool subscribed = false;
 volatile bool restartCfg = false;
 volatile bool indicateInFlight = false;
-volatile bool replyReceived = false;
-volatile uint8_t replyResult = 0;
+volatile int16_t replyFor = -1;  // monitor, ktorego dotyczyla ostatnia odpowiedz RaceChrono (-1 = zaden)
 
 uint32_t indicateSentMs = 0;
 CfgState state = CfgState::Idle;
@@ -65,11 +64,10 @@ uint8_t curSeq = 0;
 uint32_t waitStartMs = 0;
 bool configured = false;
 
-struct Slot {
-  volatile int32_t value;
-  volatile bool valid;
-};
-Slot slots[MONITOR_COUNT];
+// Ostatnia wartosc kazdego monitora, kInvalidValue = brak. Jedna liczba 32-bit zamiast pary
+// wartosc + flaga: odczyt z innego zadania jest atomowy, wiec nie da sie zlapac nowej wartosci
+// ze stara flaga waznosci.
+volatile int32_t values[MONITOR_COUNT];
 
 // Statystyki odbioru (do sprawdzenia, jak czesto RaceChrono wysyla dane).
 constexpr uint32_t kStatsPeriodMs = 5000;
@@ -98,7 +96,7 @@ uint32_t statLastMs = 0;
 }
 
 void resetValues() {
-  for (auto& s : slots) s.valid = false;
+  for (auto& v : values) v = kInvalidValue;
 }
 
 bool sendIndicate(const uint8_t* data, size_t len) {
@@ -147,8 +145,7 @@ class MonitorCfgCallbacks : public NimBLECharacteristicCallbacks {
     NimBLEAttValue v = chr->getValue();
     const uint8_t* d = v.data();
     if (v.size() < 2) return;
-    replyResult = d[0];
-    replyReceived = true;
+    replyFor = d[1];
     if (d[0] == 0) {
       Serial.printf("[RC] monitor %u OK\n", d[1]);
     } else if (d[0] == 1) {
@@ -177,8 +174,7 @@ class MonitorValCallbacks : public NimBLECharacteristicCallbacks {
       statValues[id] = statValues[id] + 1;
       int32_t val = (int32_t)(((uint32_t)d[i + 1] << 24) | ((uint32_t)d[i + 2] << 16) |
                               ((uint32_t)d[i + 3] << 8) | (uint32_t)d[i + 4]);
-      slots[id].value = val;
-      slots[id].valid = (val != kInvalidValue);
+      values[id] = val;
 #ifdef RC_DEBUG_VALUES
       Serial.printf("[RAW] t=%lu %s(%u)=%ld\n", (unsigned long)millis(), kMonitorNames[id], id, (long)val);
 #endif
@@ -207,7 +203,7 @@ void begin(const char* deviceName) {
   svc->createCharacteristic(NimBLEUUID(kCanMainUuid), NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   svc->createCharacteristic(NimBLEUUID(kCanFilterUuid), NIMBLE_PROPERTY::WRITE);
 
-  // GPS: uzywane tylko gdy cos wywoluje sendGps() (np. symulator).
+  // GPS: pozycje z modulu GPS albo symulatora (sendGps()).
   gpsMainChr = svc->createCharacteristic(NimBLEUUID(kGpsMainUuid), NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   gpsTimeChr = svc->createCharacteristic(NimBLEUUID(kGpsTimeUuid), NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
@@ -274,7 +270,7 @@ void loop() {
       buf[2] = curSeq;
       memcpy(buf + 3, eq + curOffset, n);
 
-      if (curSeq == 0) replyReceived = false;
+      if (curSeq == 0) replyFor = -1;
       if (!sendIndicate(buf, 3 + n)) break;  // sprobujemy w nastepnym obiegu
 
       curOffset += n;
@@ -286,14 +282,18 @@ void loop() {
       break;
     }
 
-    case CfgState::WaitReply:
-      if (!replyReceived && millis() - waitStartMs < kReplyTimeoutMs) break;
-      if (!replyReceived) Serial.printf("[RC] monitor %u: brak odpowiedzi\n", curMonitor);
+    case CfgState::WaitReply: {
+      // Odpowiedz musi dotyczyc biezacego monitora - spozniona (po timeoucie) odpowiedz
+      // na poprzedni nie moze zaliczyc tego.
+      const bool replied = replyFor == curMonitor;
+      if (!replied && millis() - waitStartMs < kReplyTimeoutMs) break;
+      if (!replied) Serial.printf("[RC] monitor %u: brak odpowiedzi\n", curMonitor);
       curMonitor++;
       curOffset = 0;
       curSeq = 0;
       state = (curMonitor < MONITOR_COUNT) ? CfgState::SendChunk : CfgState::SendUpdateAll;
       break;
+    }
 
     case CfgState::SendUpdateAll: {
       uint8_t cmd = kCmdUpdateAll;
@@ -362,8 +362,10 @@ bool isConnected() { return connected; }
 bool isConfigured() { return configured; }
 
 bool get(MonitorId id, int32_t& out) {
-  if (id >= MONITOR_COUNT || !slots[id].valid) return false;
-  out = slots[id].value;
+  if (id >= MONITOR_COUNT) return false;
+  const int32_t v = values[id];  // jeden odczyt
+  if (v == kInvalidValue) return false;
+  out = v;
   return true;
 }
 
