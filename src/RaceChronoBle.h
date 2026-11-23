@@ -43,5 +43,11 @@ struct GpsFix {
   float hdop, vdop;
 };
 void sendGps(const GpsFix& fix);
+// Pozycje wyslane do RaceChrono od startu (tylko przy polaczeniu) i ile z nich sie nie udalo
+// (brak miejsca w buforach Bluetooth) - diagnostyka na stronie /gps.
+struct GpsTx {
+  uint32_t sent, failed;
+};
+GpsTx gpsTx();
 
 }  // namespace rc

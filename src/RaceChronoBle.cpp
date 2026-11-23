@@ -1,4 +1,5 @@
 #include "RaceChronoBle.h"
+#include "SysLog.h"
 
 #include <NimBLEDevice.h>
 
@@ -56,6 +57,42 @@ volatile bool restartCfg = false;
 volatile bool indicateInFlight = false;
 volatile int16_t replyFor = -1;  // monitor, ktorego dotyczyla ostatnia odpowiedz RaceChrono (-1 = zaden)
 
+// Polaczenie: uchwyt, od kiedy i czy aplikacja zapisala sie na ktoras charakterystyke
+// (GPS albo monitory). Polaczenie, z ktorego nikt nie pobiera danych, blokuje RaceChrono:
+// CYD jest "zajety" i nie nadaje sygnalu, po ktorym telefon moglby polaczyc sie od nowa.
+volatile uint16_t connHandle = BLE_HS_CONN_HANDLE_NONE;
+volatile uint32_t connectedAtMs = 0;
+volatile bool usedByApp = false;
+constexpr uint32_t kIdleConnMs = 15000;  // tyle bez subskrypcji = rozlaczenie
+constexpr uint32_t kWatchMs = 1000;      // co tyle straznik sprawdza reklamowanie i polaczenie
+
+// Powtarzajace sie wpisy w logu: najwyzej jeden na minute (z liczba pominietych).
+struct LogLimit {
+  uint32_t lastMs = 0;
+  uint32_t skipped = 0;
+};
+bool logAllowed(LogLimit& l) {
+  const uint32_t now = millis();
+  if (l.lastMs != 0 && now - l.lastMs < 60000) {
+    l.skipped++;
+    return false;
+  }
+  l.lastMs = now | 1;
+  return true;
+}
+LogLimit advLog, idleLog;
+
+// Przyczyna rozlaczenia: NimBLE podaje 0x200 + kod HCI.
+const char* reasonText(int reason) {
+  switch (reason - 0x200) {
+    case 0x08: return "brak lacznosci - zasieg albo telefon przestal odpowiadac";
+    case 0x13: return "telefon zakonczyl polaczenie";
+    case 0x16: return "CYD zakonczyl polaczenie";
+    case 0x3E: return "nie udalo sie nawiazac polaczenia";
+    default: return "inna";
+  }
+}
+
 uint32_t indicateSentMs = 0;
 CfgState state = CfgState::Idle;
 uint8_t curMonitor = 0;
@@ -72,6 +109,8 @@ volatile int32_t values[MONITOR_COUNT];
 // Statystyki odbioru (do sprawdzenia, jak czesto RaceChrono wysyla dane).
 constexpr uint32_t kStatsPeriodMs = 5000;
 const char* const kMonitorNames[MONITOR_COUNT] = {"delta", "current", "prev", "best", "lap", "speed", "best_lap", "ref", "ref_lap", "last_lap", "dspeed"};
+volatile uint32_t gpsSent = 0;    // sendGps() z zadania GPS, gpsTx() ze strony WWW
+volatile uint32_t gpsFailed = 0;
 volatile uint32_t statWrites = 0;
 volatile uint32_t statValues[MONITOR_COUNT] = {};
 uint32_t statLastMs = 0;
@@ -115,29 +154,44 @@ bool canSend() {
 
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo& info) override {
+    connHandle = info.getConnHandle();
+    connectedAtMs = millis();
+    usedByApp = false;
     connected = true;
-    Serial.printf("[BLE] polaczono: %s\n", info.getAddress().toString().c_str());
+    syslog::logf("[BLE] polaczono: %s\n", info.getAddress().toString().c_str());
   }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
     connected = false;
     subscribed = false;
+    usedByApp = false;
+    connHandle = BLE_HS_CONN_HANDLE_NONE;
     restartCfg = true;
     resetValues();
-    Serial.printf("[BLE] rozlaczono (reason %d), reklamuje dalej\n", reason);
-    NimBLEDevice::startAdvertising();
+    // Jedna proba tutaj; gdyby sie nie udala, straznik w loop() ponawia co sekunde.
+    const bool adv = NimBLEDevice::startAdvertising();
+    syslog::logf("[BLE] rozlaczono: %s (kod 0x%02X), %s\n", reasonText(reason), reason & 0xFF,
+                 adv ? "nadaje sygnal dla telefonu" : "sygnal dla telefonu nie wystartowal - ponowie");
+  }
+};
+
+// Subskrypcja GPS (0x0003/0x0004) tez oznacza, ze aplikacja korzysta z polaczenia.
+class GpsChrCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t subValue) override {
+    if (subValue) usedByApp = true;
   }
 };
 
 class MonitorCfgCallbacks : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t subValue) override {
     subscribed = (subValue & 0x02) != 0;  // bit 1 = INDICATE
+    if (subValue) usedByApp = true;
     restartCfg = true;
-    Serial.printf("[BLE] monitor cfg subscribe=%u\n", subValue);
+    syslog::logf("[BLE] monitor cfg subscribe=%u\n", subValue);
   }
 
   void onStatus(NimBLECharacteristic*, int code) override {
     indicateInFlight = false;
-    if (code != 0 && code != BLE_HS_EDONE) Serial.printf("[BLE] indicate status %d\n", code);
+    if (code != 0 && code != BLE_HS_EDONE) syslog::logf("[BLE] indicate status %d\n", code);
   }
 
   // Odpowiedz RaceChrono na "Add": [wynik][id] (+ szczegoly bledu wzoru).
@@ -149,15 +203,15 @@ class MonitorCfgCallbacks : public NimBLECharacteristicCallbacks {
     if (d[0] == 0) {
       Serial.printf("[RC] monitor %u OK\n", d[1]);
     } else if (d[0] == 1) {
-      Serial.printf("[RC] monitor %u: payload poza kolejnoscia\n", d[1]);
+      syslog::logf("[RC] monitor %u: payload poza kolejnoscia\n", d[1]);
     } else if (d[0] == 2 && v.size() >= 8) {
       uint16_t type = (d[2] << 8) | d[3];
       uint16_t pos = (d[4] << 8) | d[5];
       uint16_t len = (d[6] << 8) | d[7];
-      Serial.printf("[RC] monitor %u: blad wzoru typ=%u pozycja=%u dlugosc=%u (%s)\n", d[1], type, pos, len,
-                    d[1] < MONITOR_COUNT ? kEquations[d[1]] : "?");
+      syslog::logf("[RC] monitor %u: blad wzoru typ=%u pozycja=%u dlugosc=%u (%s)\n", d[1], type, pos, len,
+                   d[1] < MONITOR_COUNT ? kEquations[d[1]] : "?");
     } else {
-      Serial.printf("[RC] monitor %u: wynik %u\n", d[1], d[0]);
+      syslog::logf("[RC] monitor %u: wynik %u\n", d[1], d[0]);
     }
   }
 };
@@ -183,8 +237,42 @@ class MonitorValCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 ServerCallbacks serverCallbacks;
+GpsChrCallbacks gpsChrCallbacks;
 MonitorCfgCallbacks monitorCfgCallbacks;
 MonitorValCallbacks monitorValCallbacks;
+
+// Straznik polaczenia (co kWatchMs, z loop()):
+// - nikt nie jest polaczony, a CYD nie nadaje sygnalu dla telefonu -> wznawia (inaczej telefon
+//   nie znajdzie CYD az do restartu),
+// - polaczenie, z ktorego przez kIdleConnMs nikt nie pobiera danych -> rozlacza.
+void watchdog() {
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  if (now - lastMs < kWatchMs) return;
+  lastMs = now;
+  if (!connected) {
+    if (!NimBLEDevice::getAdvertising()->isAdvertising()) {
+      const bool ok = NimBLEDevice::startAdvertising();
+      if (logAllowed(advLog)) {
+        syslog::logf("[BLE] CYD nie nadawal sygnalu dla telefonu - wznawiam: %s (pominiete powtorki: %lu)\n",
+                     ok ? "OK" : "blad, ponowie za 1 s", (unsigned long)advLog.skipped);
+        advLog.skipped = 0;
+      }
+    }
+  } else if (!usedByApp && now - connectedAtMs > kIdleConnMs) {
+    connectedAtMs = now;  // najwyzej jedna proba na kIdleConnMs
+    NimBLEServer* server = NimBLEDevice::getServer();
+    const uint16_t h = connHandle;
+    if (server && h != BLE_HS_CONN_HANDLE_NONE) {
+      server->disconnect(h);
+      if (logAllowed(idleLog)) {
+        syslog::logf("[BLE] polaczenie bez pobierania danych przez %lu s - rozlaczam (pominiete powtorki: %lu)\n",
+                     (unsigned long)(kIdleConnMs / 1000), (unsigned long)idleLog.skipped);
+        idleLog.skipped = 0;
+      }
+    }
+  }
+}
 
 }  // namespace
 
@@ -195,7 +283,8 @@ void begin(const char* deviceName) {
   NimBLEDevice::setPower(9);  // dBm
 
   NimBLEServer* server = NimBLEDevice::createServer();
-  server->setCallbacks(&serverCallbacks);
+  // false: obiekt jest statyczny - NimBLE nie moze go usuwac (delete) przy niszczeniu serwera
+  server->setCallbacks(&serverCallbacks, false);
 
   NimBLEService* svc = server->createService(NimBLEUUID(kServiceUuid));
 
@@ -206,6 +295,8 @@ void begin(const char* deviceName) {
   // GPS: pozycje z modulu GPS albo symulatora (sendGps()).
   gpsMainChr = svc->createCharacteristic(NimBLEUUID(kGpsMainUuid), NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   gpsTimeChr = svc->createCharacteristic(NimBLEUUID(kGpsTimeUuid), NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  gpsMainChr->setCallbacks(&gpsChrCallbacks);
+  gpsTimeChr->setCallbacks(&gpsChrCallbacks);
 
   monCfgChr =
       svc->createCharacteristic(NimBLEUUID(kMonitorCfgUuid), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
@@ -222,13 +313,14 @@ void begin(const char* deviceName) {
   adv->enableScanResponse(true);
   adv->start();
 
-  Serial.printf("[BLE] reklamuje jako \"%s\"\n", deviceName);
+  syslog::logf("[BLE] reklamuje jako \"%s\"\n", deviceName);
 }
 
 void loop() {
 #ifdef RC_DEBUG_STATS
   printStats();
 #endif
+  watchdog();
 
   if (restartCfg) {
     restartCfg = false;
@@ -287,7 +379,7 @@ void loop() {
       // na poprzedni nie moze zaliczyc tego.
       const bool replied = replyFor == curMonitor;
       if (!replied && millis() - waitStartMs < kReplyTimeoutMs) break;
-      if (!replied) Serial.printf("[RC] monitor %u: brak odpowiedzi\n", curMonitor);
+      if (!replied) syslog::logf("[RC] monitor %u: brak odpowiedzi\n", curMonitor);
       curMonitor++;
       curOffset = 0;
       curSeq = 0;
@@ -300,7 +392,7 @@ void loop() {
       if (sendIndicate(&cmd, 1)) {
         state = CfgState::Done;
         configured = true;
-        Serial.println("[RC] konfiguracja monitorow zakonczona");
+        syslog::logf("[RC] konfiguracja monitorow zakonczona\n");
       }
       break;
     }
@@ -324,6 +416,7 @@ static void put32(uint8_t* b, int32_t v) {
   b[3] = u;
 }
 
+
 void sendGps(const GpsFix& f) {
   if (!gpsMainChr) return;
 
@@ -338,7 +431,8 @@ void sendGps(const GpsFix& f) {
     gpsTimeChr->setValue(t, sizeof(t));
   }
   // Czas wysylamy w kazdym cyklu razem z pozycja (ta sama wartosc sync).
-  if (connected) gpsTimeChr->notify();
+  bool ok = true;
+  if (connected) ok = gpsTimeChr->notify();
 
   // 0x0003: glowna ramka GPS, 20 bajtow
   uint8_t b[20];
@@ -355,8 +449,14 @@ void sendGps(const GpsFix& f) {
   b[19] = (uint8_t)min(254L, lround(f.vdop * 10.0f));
 
   gpsMainChr->setValue(b, sizeof(b));
-  if (connected) gpsMainChr->notify();
+  if (connected) {
+    ok = gpsMainChr->notify() && ok;
+    gpsSent = gpsSent + 1;
+    if (!ok) gpsFailed = gpsFailed + 1;
+  }
 }
+
+GpsTx gpsTx() { return GpsTx{gpsSent, gpsFailed}; }
 
 bool isConnected() { return connected; }
 bool isConfigured() { return configured; }

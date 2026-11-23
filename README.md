@@ -13,7 +13,7 @@ Wyswietlacz do [RaceChrono](https://racechrono.com) na plytce ESP32 "Cheap Yello
 | Element | Polaczenie |
 |---|---|
 | Wyswietlacz | wbudowany: HSPI (SCLK 14, MOSI 13, MISO 12, CS 15, DC 2), podswietlenie 21 |
-| Karta microSD (FAT32) | wbudowany slot: VSPI (SCK 18, MISO 19, MOSI 23, CS 5) |
+| Karta microSD (FAT32 albo exFAT, tablica partycji MBR) | wbudowany slot: VSPI (SCK 18, MISO 19, MOSI 23, CS 5) |
 | GPS GEPRC GEP-M10 (u-blox M10) | zlacze CN1: GPS TX -> IO27, GPS RX <- IO22, GND |
 
 Jesli kolory sa odwrocone albo czerwony i niebieski sa zamienione, zmien `invert` / `rgb_order`
@@ -32,8 +32,8 @@ w `include/LGFX_CYD.h`.
 
 - Kropka: szara - brak polaczenia z RaceChrono, zolta - rejestracja monitorow, zielona - gotowe.
 - `GPS`: szary - brak poprawnych danych z modulu, zolty - brak fixa, zielony - fix.
-- `SD`: czerwony - brak karty albo blad zapisu (ponowna proba co 5 s), zolty - czeka na fix,
-  zielony - zapis.
+- `SD`: czerwony - brak karty albo blad zapisu (ponowna proba co 5 s) albo tryb awaryjny
+  (patrz Log i tryb awaryjny), zolty - czeka na fix, zielony - zapis.
 - Ikona WiFi (obok `SD`): zolte luki - siec WiFi czeka na podlaczenie, zielony wachlarz - ktos
   jest podlaczony.
 - Prawy rog: satelity uzyte w rozwiazaniu (przed fixem szare, zwykle 0-3), z fixem dodatkowo
@@ -55,9 +55,9 @@ Flagi w `build_flags` w `platformio.ini`:
 | `GPS_UART_RX`, `GPS_UART_TX` | piny UART modulu GPS; bez `GPS_UART_RX` - praca bez modulu |
 | `GPS_UBLOX_M10` | autokonfiguracja M10: wykrycie predkosci UART, czestotliwosc, tryb automotive |
 | `GPS_UART_BAUD` | docelowa predkosc UART modulu |
-| `GPS_MODE` | domyslny tryb GPS (zmiana na stronie WiFi): `25` - 25 Hz, sam GPS; `20` - 20 Hz, GPS+Galileo; `10` - 10 Hz, GPS+Galileo+BeiDou+QZSS |
+| `GPS_MODE` | domyslny tryb GPS (zmiana na stronie WiFi): `25` - 25 Hz, sam GPS; `20` - 20 Hz, GPS+Galileo; `10` - 10 Hz, GPS+Galileo+BeiDou (QZSS zawsze wylaczony - w Europie niewidoczny) |
 | `SIM_GPS` | symulowany GPS (kolo ~20 s, 10 Hz) zamiast modulu - nie razem z `GPS_UART_RX` |
-| `OTA_WIFI` | wgrywanie przez WiFi: siec `RC-CYD-OTA` przez 60 s po starcie (patrz nizej) |
+| `OTA_WIFI` | wgrywanie przez WiFi: siec `RC-CYD-OTA` przez 30 s po starcie (patrz nizej) |
 | `GPS_DEBUG`, `RC_DEBUG_VALUES`, `RC_DEBUG_STATS`, `SIM_DEBUG` | diagnostyka na porcie szeregowym |
 
 Modul jest konfigurowany przy kazdym starcie (tylko RAM modulu). Jesli przestanie wysylac
@@ -78,15 +78,23 @@ Port szeregowy: 115200 bps.
 
 ### WiFi: ustawienia i wgrywanie
 
-Przez 60 s po wlaczeniu wyswietlacz nadaje siec WiFi `RC-CYD-OTA` (zolta ikona WiFi na pasku
+Przez 30 s po wlaczeniu wyswietlacz nadaje siec WiFi `RC-CYD-OTA` (zolta ikona WiFi na pasku
 stanu). Gdy nikt sie nie podlaczy, WiFi wylacza sie do nastepnego startu i nie zuzywa pradu.
-Z podlaczonym urzadzeniem (zielona ikona) siec trwa, dopoki jest polaczenie, i 60 s po rozlaczeniu.
+Z podlaczonym urzadzeniem (zielona ikona) siec trwa, dopoki jest polaczenie, i 30 s po rozlaczeniu.
 
 Strona `http://192.168.4.1` pozwala ustawic nazwe Bluetooth (widoczna w RaceChrono) i tryb GPS
 (25 / 20 / 10 Hz). Ustawienia sa zapisane w pamieci plytki - przetrwaja restart i wgranie nowego
-programu; po zapisie wyswietlacz sie restartuje.
+programu; po zapisie wyswietlacz sie restartuje. Pozostale strony:
 
-1. Wlacz wyswietlacz i w ciagu 60 s podlacz laptop albo telefon do sieci `RC-CYD-OTA`.
+- `/files` - pliki z karty SD (`/gpx`): pobieranie, usuwanie pojedynczo albo wszystkich poza
+  biezacym zapisem. Podczas pobierania ekran stoi (strony i ekran obsluguje ta sama petla).
+- `/gps` - diagnostyka GPS, odswiezana co sekunde: rzeczywista liczba epok na sekunde i zgubione
+  epoki (z czasu w danych modulu), pozycje wyslane do RaceChrono i nieudane wysylki, czas do
+  pierwszego fixa, satelity z sila sygnalu (C/N0), szum i AGC wejscia radiowego. Przyciski testu
+  zaklocen: ekran albo zapis SD wylaczone na 20 s - wykres pokazuje, czy sygnal sie zmienia.
+  Dodatkowe dane z modulu (UBX) plyna tylko przy otwartej stronie.
+
+1. Wlacz wyswietlacz i w ciagu 30 s podlacz laptop albo telefon do sieci `RC-CYD-OTA`.
 2. Wgraj program jednym ze sposobow:
    - **przegladarka:** otworz `http://192.168.4.1`, wybierz plik `.pio/build/cyd/firmware.bin`
      (powstaje przy kazdym Build) i kliknij Wgraj. Telefon moze ostrzec, ze siec nie ma
@@ -95,9 +103,37 @@ programu; po zapisie wyswietlacz sie restartuje.
      potem Upload).
 3. Na ekranie widac postep, po wgraniu wyswietlacz sam sie restartuje.
 
+Na czas wgrywania CYD zatrzymuje GPS i zapis na SD (domyka pliki) - zwalnia to ok. 27 kB RAM,
+bez czego wgrywanie przy wszystkim wlaczonym potrafilo sie przerwac. Gdy wgrywanie sie nie
+uda, CYD sam sie restartuje i wraca do normalnej pracy.
+
 Haslo sieci i wgrywania: `12345678` (sekcja `[ota]` w `platformio.ini`). Pierwsze wgranie po przejsciu na
 dwie partycje aplikacji (`min_spiffs.csv`) musi byc przez USB (srodowisko `cyd`). Jesli wgrywanie
 nie startuje, sprawdz zapore na laptopie - wyswietlacz laczy sie zwrotnie z laptopem po TCP.
+
+### Karta SD
+
+Obsluga karty: biblioteka SdFat - FAT16/FAT32 albo exFAT (fabryczny na kartach 64 GB i wiekszych),
+ale tylko na tablicy partycji MBR. Karta sformatowana w Linuksie czesto dostaje GPT - wtedy `SD`
+swieci na czerwono, a log mowi "karta SD jest, ale bez FAT32/exFAT na tablicy MBR".
+Formatowanie w Linuksie (`/dev/sdX` = karta, sprawdz w `lsblk`!):
+
+```
+sudo umount /dev/sdX1
+sudo parted -s /dev/sdX mklabel msdos mkpart primary fat32 1MiB 100%
+sudo mkfs.fat -F 32 -n RCDASH /dev/sdX1
+```
+
+### Log i tryb awaryjny
+
+Na stronie `http://192.168.4.1` jest sekcja Stan (przyczyna ostatniego restartu, karta SD, RAM)
+i link do logu `http://192.168.4.1/log`: komunikaty biezacego i poprzedniego uruchomienia.
+Log jest w pamieci RTC, wiec przetrwa restart po bledzie (i widac, co dzialo sie tuz przed nim);
+znika po odlaczeniu zasilania.
+
+Gdy dwa uruchomienia z rzedu skoncza sie bledem (panic, watchdog, spadek napiecia) w ciagu 20 s
+od startu, nastepne startuje w trybie awaryjnym: bez zapisu na SD (czerwone `SD`), reszta dziala
+i WiFi jest dostepne. Wylaczenie i wlaczenie zasilania albo wgranie programu probuje od nowa.
 
 Czcionki w `include/fonts_saira.h` generuje `tools/make_fonts.py` (wymaga Pillow) z czcionki
 Saira (SIL Open Font License 1.1).

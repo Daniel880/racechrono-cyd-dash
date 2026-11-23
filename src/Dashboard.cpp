@@ -1,4 +1,5 @@
 #include "Dashboard.h"
+#include "SysLog.h"
 
 #include <Arduino.h>
 #include <stdio.h>
@@ -69,7 +70,7 @@ Panel pBest{0, 260, 240, kBigH, &bigSpr};  // 260..317, 2 dolne wiersze ekranu z
 void createSpr(LGFX_Sprite& s, int16_t w, int16_t h, uint8_t depth) {
   s.setColorDepth(depth);
   if (s.createSprite(w, h)) return;
-  Serial.printf("[UI] brak RAM na bufor %dx%d w %u bit\n", w, h, depth);
+  syslog::logf("[UI] brak RAM na bufor %dx%d w %u bit\n", w, h, depth);
   if (depth > 8) createSpr(s, w, h, 8);  // awaryjnie 8 bit (mniej plynne wygladzanie)
 }
 
@@ -90,6 +91,8 @@ bool changed(Panel& p, const char* key) {
 void push(Panel& p) { p.spr->pushSprite(lcd, p.x, p.y); }
 
 bool otaScreen = false;  // na ekranie jest postep wgrywania przez WiFi
+uint32_t blankUntil = 0;  // test zaklocen: do tej chwili ekran wylaczony (0 = nie)
+bool blanked = false;
 
 // Linie oddzielajace panele (1 px przerwy miedzy nimi).
 void drawSeparators() {
@@ -327,8 +330,8 @@ void begin(LGFX& display) {
   fontTime.loadFont(&fontTimeData);
   createSpr(statusSpr, 240, 24, 8);
   createSpr(bigSpr, 240, kBigH, 16);
-  Serial.printf("[UI] wolny RAM %u B, najwiekszy blok %u B\n", (unsigned)ESP.getFreeHeap(),
-                (unsigned)ESP.getMaxAllocHeap());
+  syslog::logf("[UI] wolny RAM %u B, najwiekszy blok %u B\n", (unsigned)ESP.getFreeHeap(),
+               (unsigned)ESP.getMaxAllocHeap());
   drawSeparators();
 }
 
@@ -351,8 +354,30 @@ void showOtaProgress(int percent) {
   lcd->drawString(t, 120, 200);
 }
 
+void blankFor(uint32_t ms) { blankUntil = (millis() + ms) | 1; }
+
+uint32_t blankLeftMs() {
+  const int32_t left = blankUntil ? (int32_t)(blankUntil - millis()) : 0;
+  return left > 0 ? (uint32_t)left : 0;
+}
+
 void update(const DashData& d) {
-  if (otaScreen) {  // wgrywanie przerwane - zwykly ekran od nowa
+  if (blankLeftMs() > 0) {
+    if (!blanked) {
+      blanked = true;
+      lcd->setBrightness(0);
+      syslog::logf("[TEST] ekran wylaczony\n");
+    }
+    return;
+  }
+  if (blanked) {
+    blanked = false;
+    blankUntil = 0;
+    lcd->setBrightness(255);
+    otaScreen = true;  // ponizej: caly ekran od nowa
+    syslog::logf("[TEST] ekran wlaczony\n");
+  }
+  if (otaScreen) {  // wgrywanie przerwane albo koniec testu - zwykly ekran od nowa
     otaScreen = false;
     lcd->fillScreen(COL_BG);
     drawSeparators();

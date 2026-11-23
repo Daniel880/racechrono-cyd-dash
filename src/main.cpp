@@ -6,6 +6,7 @@
 #include "OtaUpdate.h"
 #include "RaceChronoBle.h"
 #include "Settings.h"
+#include "SysLog.h"
 
 #ifdef SIM_GPS
 #include "GpsSim.h"
@@ -49,8 +50,16 @@ static void handleFix(const rc::GpsFix& fix) {
   gpx::addFix(fix);
 }
 
+static TaskHandle_t gpsTaskHandle = nullptr;
+static volatile bool gpsStopReq = false;  // tryb wgrywania: zadanie GPS konczy sie samo
+static volatile bool gpsStopped = false;
+
 static void gpsTask(void*) {
   for (;;) {
+    if (gpsStopReq) {
+      gpsStopped = true;
+      vTaskDelete(nullptr);
+    }
     rc::GpsFix fix;
     if (gpsrx::update(fix)) handleFix(fix);
 #ifdef SIM_GPS
@@ -60,8 +69,29 @@ static void gpsTask(void*) {
   }
 }
 
+static void logHeap(const char* after);
+
+// Tryb wgrywania programu przez WiFi: zwalnia RAM (~27 kB), po wgraniu i tak jest restart.
+// Najpierw GPS (doklada do kolejki SD), potem karta. Bluetooth zostaje: wylaczanie NimBLE
+// (deinit) w trakcie pracy jest ryzykowne, a bez niego RAM-u i tak wystarcza.
+static void enterUpdateMode() {
+  syslog::logf("[OTA] tryb wgrywania: zatrzymuje GPS i zapis SD\n");
+  gpsStopReq = true;
+  for (int i = 0; i < 50 && gpsTaskHandle && !gpsStopped; i++) delay(10);
+  gpsrx::stop();
+  syslog::logf("[OTA] GPS zatrzymany%s\n", gpsStopped || !gpsTaskHandle ? "" : " (zadanie nie odpowiedzialo)");
+  gpx::shutdown();
+  logHeap("wejsciu w tryb wgrywania");
+}
+
+static void logHeap(const char* after) {
+  syslog::logf("[SYS] po %s: wolny RAM %u B, najwiekszy blok %u B\n", after, (unsigned)ESP.getFreeHeap(),
+               (unsigned)ESP.getMaxAllocHeap());
+}
+
 void setup() {
   Serial.begin(115200);
+  syslog::begin();  // przyczyna restartu, licznik awarii (tryb awaryjny bez SD), log w pamieci RTC
 
   // Dioda RGB na CYD jest aktywna stanem niskim - wylaczamy ja.
   for (int pin : {4, 16, 17}) {
@@ -72,11 +102,19 @@ void setup() {
   lcd.setRotation(2);  // pionowo, 240x320 (obrot o 90 st. w prawo wzgledem dawnego 1)
   lcd.setBrightness(255);
   dash::begin(lcd);
+  logHeap("ekranie");
 
   // nazwa Bluetooth i tryb GPS - ustawiane na stronie WiFi, zapisane w pamieci NVS
   const settings::Settings cfg = settings::load();
   rc::begin(cfg.btName);
-  gpx::begin();                // backup na SD we wlasnym zadaniu (tylko z -DGPX_LOG)
+  logHeap("Bluetooth");
+  // WiFi do wgrywania tylko przez chwile po starcie (tylko z -DOTA_WIFI), potem wylaczone.
+  // Przed karta SD: przy braku RAM-u start WiFi konczy sie bledem programu, a karta SD
+  // tylko stanem Error (i probuje znowu, gdy WiFi sie wylaczy i zwolni pamiec).
+  ota::begin(dash::showOtaProgress, enterUpdateMode);
+  logHeap("WiFi");
+  gpx::begin(!syslog::safeMode());  // backup na SD we wlasnym zadaniu (tylko z -DGPX_LOG)
+  logHeap("karcie SD");
   gpsrx::begin(cfg.gpsMode);  // modul GPS na UART (tylko z -DGPS_UART_RX)
 
 #ifdef SIM_GPS
@@ -85,14 +123,21 @@ void setup() {
 
   // GPS w osobnym zadaniu o wyzszym priorytecie niz loop(): rysowanie ekranu
   // i zapis na SD nie opozniaja wysylki pozycji do RaceChrono.
-  xTaskCreatePinnedToCore(gpsTask, "gps", 8192, nullptr, 2, nullptr, ARDUINO_RUNNING_CORE);
-  // WiFi do wgrywania tylko przez chwile po starcie (tylko z -DOTA_WIFI), potem wylaczone.
-  ota::begin(dash::showOtaProgress);
-  Serial.printf("[SYS] po starcie: wolny RAM %u B, najwiekszy blok %u B\n", (unsigned)ESP.getFreeHeap(),
-                (unsigned)ESP.getMaxAllocHeap());
+  xTaskCreatePinnedToCore(gpsTask, "gps", 8192, nullptr, 2, &gpsTaskHandle, ARDUINO_RUNNING_CORE);
+  logHeap("GPS (koniec startu)");
 }
 
 void loop() {
+  syslog::loop();
+  // raz, po 30 s: zapas stosow (do strojenia pamieci)
+  static bool stacksLogged = false;
+  if (!stacksLogged && millis() > 30000) {
+    stacksLogged = true;
+    syslog::logf("[SYS] wolny stos: gps %u B, loop %u B; wolny RAM %u B (minimum %u B)\n",
+                 gpsTaskHandle ? (unsigned)uxTaskGetStackHighWaterMark(gpsTaskHandle) : 0u,
+                 (unsigned)uxTaskGetStackHighWaterMark(nullptr), (unsigned)ESP.getFreeHeap(),
+                 (unsigned)ESP.getMinFreeHeap());
+  }
   ota::loop();
   rc::loop();
 

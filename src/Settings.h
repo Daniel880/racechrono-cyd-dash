@@ -12,7 +12,7 @@ constexpr size_t kNameMax = 20;
 
 struct Settings {
   char btName[kNameMax + 1];
-  uint8_t gpsMode;  // 25 = 25 Hz GPS, 20 = 20 Hz GPS+Galileo, 10 = 10 Hz GPS+Galileo+BeiDou+QZSS
+  uint8_t gpsMode;  // 25 = 25 Hz GPS, 20 = 20 Hz GPS+Galileo, 10 = 10 Hz GPS+Galileo+BeiDou
 };
 
 Settings load();               // domyslne wartosci, gdy nic nie zapisano

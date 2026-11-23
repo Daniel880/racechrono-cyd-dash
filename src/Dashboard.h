@@ -40,4 +40,8 @@ namespace dash {
 void begin(LGFX& lcd);
 void update(const DashData& d);       // przerysowuje tylko zmienione pola
 void showOtaProgress(int percent);    // caly ekran: postep wgrywania przez WiFi (0..100)
+// Test zaklocen GPS: przez ms ekran bez podswietlenia i bez rysowania (zero transmisji do ekranu).
+// Wolac z tego samego zadania co update() (loop).
+void blankFor(uint32_t ms);
+uint32_t blankLeftMs();
 }  // namespace dash
