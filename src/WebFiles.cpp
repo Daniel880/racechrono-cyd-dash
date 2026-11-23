@@ -56,7 +56,7 @@ void handleList() {
   t += String(gpx::cardMB() / 1024.0f, 1);
   t += " GB. Czas zmiany plikow: UTC z GPS. Biezacy plik ma na karcie dane sprzed najwyzej 2 s.</p>";
   if (blocked) t += kBlockedHtml;
-  t += "<table><tr><th>Plik</th><th>Rozmiar</th><th>Zmieniony</th><th></th></tr>";
+  t += "<table><thead><tr><th>Plik</th><th>Rozmiar</th><th>Zmieniony</th><th></th></tr></thead><tbody id='fl'>";
   s.sendContent(t);
 
   gpx::FileInfo fi;
@@ -92,7 +92,15 @@ void handleList() {
     t += "</td></tr>";
     s.sendContent(t);
   }
-  t = "</table><p>";
+  // Karta podaje pliki w kolejnosci katalogu, a sortowanie tutaj wymagaloby trzymania calej listy
+  // w RAM (brakuje go dla WiFi) - sortuje przegladarka: log.txt, log_old.txt, potem sesje od
+  // najnowszej (nazwa = data i czas startu, wiec malejaco po nazwie), w parze .gpx przed .nmea.
+  t = "</tbody></table><script>(()=>{const k=n=>{const i=n.lastIndexOf('.');"
+      "return[n.startsWith('log')?0:1,i<0?n:n.slice(0,i),i<0?'':n.slice(i)]};"
+      "const c=(a,b)=>a<b?-1:a>b?1:0;"
+      "[...fl.rows].map(r=>[k(r.cells[0].textContent),r]).sort(([a],[b])=>"
+      "a[0]-b[0]||(a[0]?c(b[1],a[1]):c(a[1],b[1]))||c(a[2],b[2])).forEach(([,r])=>fl.appendChild(r))})()"
+      "</script><p>";
   t += count;
   t += count == 1 ? " plik, " : " plikow, ";
   t += humanSize(total);
