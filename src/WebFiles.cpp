@@ -26,6 +26,13 @@ String humanSize(uint32_t b) {
   return t;
 }
 
+// Pobieranie tylko bez polaczonego RaceChrono: WiFi i Bluetooth dziela jedno radio, a duzy
+// transfer moglby opozniac pozycje GPS wysylane do telefonu. Pozycje maja pierwszenstwo.
+const char kBlockedHtml[] =
+    "<p class='err'>RaceChrono jest polaczone przez Bluetooth - pobieranie zablokowane, zeby nie "
+    "opozniac pozycji GPS. Rozlacz RaceChrono (np. zamknij aplikacje albo wylacz Bluetooth w "
+    "telefonie) i odswiez strone.</p>";
+
 // Lista wysylana kawalkami (bez skladania calej strony w RAM): kazdy plik = jeden wiersz.
 void handleList() {
   WebServer& s = *srv;
@@ -43,10 +50,13 @@ void handleList() {
     s.sendContent("");
     return;
   }
+  // Blokada pobierania przy polaczonym RaceChrono (patrz handleDownload) - nazwy bez linkow.
+  const bool blocked = rc::isConnected();
   String t = "<p>Karta ";
   t += String(gpx::cardMB() / 1024.0f, 1);
-  t += " GB. Czas zmiany plikow: UTC z GPS. Biezacy plik ma na karcie dane sprzed najwyzej 2 s.</p>"
-       "<table><tr><th>Plik</th><th>Rozmiar</th><th>Zmieniony</th><th></th></tr>";
+  t += " GB. Czas zmiany plikow: UTC z GPS. Biezacy plik ma na karcie dane sprzed najwyzej 2 s.</p>";
+  if (blocked) t += kBlockedHtml;
+  t += "<table><tr><th>Plik</th><th>Rozmiar</th><th>Zmieniony</th><th></th></tr>";
   s.sendContent(t);
 
   gpx::FileInfo fi;
@@ -55,11 +65,17 @@ void handleList() {
     count++;
     total += fi.size;
     // nazwy sprawdzone w gpx (litery, cyfry, - _ .) - bezpieczne w HTML, URL i JS
-    t = "<tr><td><a href='/dl?f=";
-    t += fi.name;
-    t += "'>";
-    t += fi.name;
-    t += "</a></td><td>";
+    if (blocked) {
+      t = "<tr><td>";
+      t += fi.name;
+    } else {
+      t = "<tr><td><a href='/dl?f=";
+      t += fi.name;
+      t += "'>";
+      t += fi.name;
+      t += "</a>";
+    }
+    t += "</td><td>";
     t += humanSize(fi.size);
     t += "</td><td>";
     t += fi.modified;
@@ -93,13 +109,16 @@ void handleList() {
 
 constexpr size_t kChunk = 2048;
 // Tyle bez postepu (karta zajeta albo przegladarka nie potwierdza danych) = koniec pobierania.
-// WiFi dzieli antene z Bluetooth, wiec przy polaczonym RaceChrono przestoje po kilka sekund
-// sie zdarzaja - samo write() poddaje sie po 10 s bez potwierdzenia, a to jeszcze nie koniec.
+// Samo write() poddaje sie po 10 s bez potwierdzenia - chwilowy przestoj WiFi to jeszcze nie koniec.
 constexpr uint32_t kStallMs = 30000;
 
 void handleDownload() {
   WebServer& s = *srv;
   const String name = s.arg("f");
+  if (rc::isConnected()) {
+    s.send(409, "text/html", String(kHead) + kBlockedHtml + "<p><a href='/files'>Pliki</a></p></body></html>");
+    return;
+  }
   uint32_t size = 0;
   if (!gpx::readOpen(name.c_str(), size)) {
     s.send(404, "text/plain", "Nie ma takiego pliku albo karta niedostepna");
@@ -111,9 +130,8 @@ void handleDownload() {
     s.send(500, "text/plain", "Brak RAM");
     return;
   }
-  const bool bt = rc::isConnected();
-  syslog::logf("[WWW] pobieranie %s (%lu kB), wolny RAM %u B, Bluetooth %s\n", name.c_str(),
-               (unsigned long)(size / 1024), (unsigned)ESP.getFreeHeap(), bt ? "polaczony" : "wolny");
+  syslog::logf("[WWW] pobieranie %s (%lu kB), wolny RAM %u B\n", name.c_str(), (unsigned long)(size / 1024),
+               (unsigned)ESP.getFreeHeap());
   const bool gpxFile = name.endsWith(".gpx");
   s.setContentLength(size);
   s.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
@@ -126,6 +144,12 @@ void handleDownload() {
   uint32_t lastProgress = t0, sent = 0, cardMaxMs = 0, wifiMaxMs = 0, minHeap = ESP.getFreeHeap();
   const char* why = nullptr;  // nullptr = calosc wyslana
   while (sent < size && !why) {
+    // RaceChrono polaczylo sie w trakcie: pozycje GPS maja pierwszenstwo, przegladarka dostanie
+    // niepelny plik (zglosi blad)
+    if (rc::isConnected()) {
+      why = "RaceChrono polaczone";
+      break;
+    }
     uint32_t t = millis();
     const int n = gpx::readChunk(buf, size - sent < kChunk ? size - sent : kChunk);
     t = millis() - t;

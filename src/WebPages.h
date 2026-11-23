@@ -1,6 +1,6 @@
 #pragma once
 // Strony WWW wyswietlacza (serwer w OtaUpdate.cpp, dziala tylko przy wlaczonym WiFi):
-//   /files - pliki z karty SD: pobieranie i usuwanie
+//   /files - pliki z karty SD: pobieranie (tylko bez polaczonego RaceChrono) i usuwanie
 //   /gps   - diagnostyka GPS: czestotliwosc, satelity, sygnal, test zaklocen
 // Wszystko obslugiwane w zadaniu loop() - podczas pobierania pliku ekran stoi.
 
