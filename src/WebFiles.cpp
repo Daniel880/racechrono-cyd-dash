@@ -7,6 +7,8 @@
 #include <WebServer.h>
 
 #include "GpxLogger.h"
+#include "RaceChronoBle.h"
+#include "SysLog.h"
 
 namespace web {
 namespace {
@@ -89,6 +91,12 @@ void handleList() {
   s.sendContent("");
 }
 
+constexpr size_t kChunk = 2048;
+// Tyle bez postepu (karta zajeta albo przegladarka nie potwierdza danych) = koniec pobierania.
+// WiFi dzieli antene z Bluetooth, wiec przy polaczonym RaceChrono przestoje po kilka sekund
+// sie zdarzaja - samo write() poddaje sie po 10 s bez potwierdzenia, a to jeszcze nie koniec.
+constexpr uint32_t kStallMs = 30000;
+
 void handleDownload() {
   WebServer& s = *srv;
   const String name = s.arg("f");
@@ -97,26 +105,73 @@ void handleDownload() {
     s.send(404, "text/plain", "Nie ma takiego pliku albo karta niedostepna");
     return;
   }
-  uint8_t* buf = (uint8_t*)malloc(2048);
+  uint8_t* buf = (uint8_t*)malloc(kChunk);
   if (!buf) {
     gpx::readClose();
     s.send(500, "text/plain", "Brak RAM");
     return;
   }
+  const bool bt = rc::isConnected();
+  syslog::logf("[WWW] pobieranie %s (%lu kB), wolny RAM %u B, Bluetooth %s\n", name.c_str(),
+               (unsigned long)(size / 1024), (unsigned)ESP.getFreeHeap(), bt ? "polaczony" : "wolny");
   const bool gpxFile = name.endsWith(".gpx");
   s.setContentLength(size);
   s.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
   s.send(200, gpxFile ? "application/gpx+xml" : "text/plain", "");
+
   // Kawalkami: blokada karty tylko na czas odczytu, zapis trasy idzie w tym czasie dalej.
-  uint32_t left = size;
-  while (left) {
-    const int n = gpx::readChunk(buf, left < 2048 ? left : 2048);
-    if (n <= 0) break;  // karta wyjeta - przegladarka zglosi niepelny plik
-    if (s.client().write(buf, n) != (size_t)n) break;
-    left -= n;
+  // Zapisujemy tez, gdzie szedl czas (karta / WiFi) - do diagnozy w logu.
+  auto& c = s.client();
+  const uint32_t t0 = millis();
+  uint32_t lastProgress = t0, sent = 0, cardMaxMs = 0, wifiMaxMs = 0, minHeap = ESP.getFreeHeap();
+  const char* why = nullptr;  // nullptr = calosc wyslana
+  while (sent < size && !why) {
+    uint32_t t = millis();
+    const int n = gpx::readChunk(buf, size - sent < kChunk ? size - sent : kChunk);
+    t = millis() - t;
+    if (t > cardMaxMs) cardMaxMs = t;
+    if (n == gpx::kReadBusy) {
+      if (millis() - lastProgress > kStallMs) why = "karta zajeta";
+      continue;
+    }
+    if (n <= 0) {
+      why = n == 0 ? "plik krotszy niz podany rozmiar" : "karta niedostepna";
+      break;
+    }
+    size_t done = 0;
+    while (done < (size_t)n) {
+      t = millis();
+      const size_t w = c.write(buf + done, n - done);  // czeka do 10 s na miejsce w buforze TCP
+      t = millis() - t;
+      if (t > wifiMaxMs) wifiMaxMs = t;
+      if (w) {
+        done += w;
+        lastProgress = millis();
+      } else if (!c.connected()) {
+        why = "przegladarka rozlaczyla sie";
+        break;
+      } else if (millis() - lastProgress > kStallMs) {
+        why = "przegladarka nie odbiera danych";
+        break;
+      }
+    }
+    sent += done;
+    const uint32_t heap = ESP.getFreeHeap();
+    if (heap < minHeap) minHeap = heap;
   }
   free(buf);
   gpx::readClose();
+
+  const uint32_t ms = millis() - t0;
+  // linia logu ma najwyzej ~180 znakow, wiec wynik i diagnostyka osobno
+  syslog::logf("[WWW] koniec: %lu z %lu kB w %lu s (%lu kB/s) - %s%s\n", (unsigned long)(sent / 1024),
+               (unsigned long)(size / 1024), (unsigned long)(ms / 1000),
+               (unsigned long)(ms ? (uint64_t)sent * 1000 / 1024 / ms : 0), why ? "PRZERWANE: " : "OK",
+               why ? why : "");
+  // max = najdluzsze pojedyncze czekanie; RAM: najmniej w trakcie (co kawalek) i od startu
+  syslog::logf("[WWW] max czekanie: karta %lu ms, WiFi %lu ms; wolny RAM min %u B, od startu %u B\n",
+               (unsigned long)cardMaxMs, (unsigned long)wifiMaxMs, (unsigned)minHeap,
+               (unsigned)ESP.getMinFreeHeap());
 }
 
 void handleRemove() {

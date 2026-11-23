@@ -586,7 +586,7 @@ bool readOpen(const char* name, uint32_t& size) {
 }
 
 int readChunk(uint8_t* buf, size_t len) {
-  if (!lock()) return -1;
+  if (!lock()) return kReadBusy;
   int n = -1;
   if (mounted() && webFileGen == mountGen && webFile.isOpen()) {
     if (webPos >= webFooterAt) {

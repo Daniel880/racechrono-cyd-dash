@@ -42,7 +42,8 @@ bool listOpen();  // false = karta niezamontowana
 bool listNext(FileInfo& out);
 void listClose();
 bool readOpen(const char* name, uint32_t& size);
-int readChunk(uint8_t* buf, size_t len);  // liczba bajtow, 0 = koniec, < 0 = blad
+constexpr int kReadBusy = -2;              // readChunk(): karta zajeta przez zapis - sprobuj znowu
+int readChunk(uint8_t* buf, size_t len);  // liczba bajtow, 0 = koniec, kReadBusy, inne < 0 = blad
 void readClose();
 const char* removeFile(const char* name);  // nullptr = usunieto, inaczej powod
 int removeInactive();                      // usuwa wszystko poza biezaca para; < 0 = brak karty

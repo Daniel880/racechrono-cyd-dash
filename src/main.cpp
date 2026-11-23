@@ -123,7 +123,8 @@ void setup() {
 
   // GPS w osobnym zadaniu o wyzszym priorytecie niz loop(): rysowanie ekranu
   // i zapis na SD nie opozniaja wysylki pozycji do RaceChrono.
-  xTaskCreatePinnedToCore(gpsTask, "gps", 8192, nullptr, 2, &gpsTaskHandle, ARDUINO_RUNNING_CORE);
+  // Stos 5 kB: zmierzone zuzycie ~1.8 kB (z konfiguracja M10) - log "[SYS] wolny stos" po 30 s.
+  xTaskCreatePinnedToCore(gpsTask, "gps", 5120, nullptr, 2, &gpsTaskHandle, ARDUINO_RUNNING_CORE);
   logHeap("GPS (koniec startu)");
 }
 

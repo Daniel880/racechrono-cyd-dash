@@ -250,7 +250,9 @@ void begin(void (*onProgress)(int), void (*onUpdateStart)()) {
   progressCb = onProgress;
   updateStartCb = onUpdateStart;
   WiFi.persistent(false);  // bez zapisywania ustawien WiFi we flash
-  if (!WiFi.mode(WIFI_AP) || !WiFi.softAP(kSsid, OTA_PASSWORD)) {
+  // max 1 urzadzenie: drugie (np. telefon, ktory sam dolacza do znanej sieci) zajmowaloby RAM
+  // na bufory WiFi, a tego brakuje przy pobieraniu plikow
+  if (!WiFi.mode(WIFI_AP) || !WiFi.softAP(kSsid, OTA_PASSWORD, 1, 0, 1)) {
     syslog::logf("[OTA] nie moge uruchomic WiFi (wolny RAM %u B)\n", (unsigned)ESP.getFreeHeap());
     WiFi.mode(WIFI_OFF);
     return;
