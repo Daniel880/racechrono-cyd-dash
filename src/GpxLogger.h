@@ -2,7 +2,8 @@
 // Backup trasy na karte SD (CYD), niezalezny od telefonu i RaceChrono.
 // Kazde uruchomienie = nowa para plikow, nazwa = data i czas (UTC) pierwszego fixa GPS:
 //   /gpx/2026-11-13_14-05-32.gpx   - trasa (czas, wysokosc, predkosc, kurs, satelity)
-//   /gpx/2026-11-13_14-05-32.nmea  - surowe zdania NMEA z modulu GPS
+//   /gpx/2026-11-13_14-05-32.ubx   - surowe ramki UBX z modulu GPS: pozycja w kazdej epoce,
+//                                    satelity, zaklocenia, widmo i stan modulu raz na sekunde
 // Pliki powstaja przy pierwszym fixie, wiec bez GPS nie ma pustych plikow.
 // Gdyby plik o tej nazwie juz istnial, dopisywany jest numer: ..._2.gpx, ..._3.gpx.
 // Karta: FAT16/FAT32 albo exFAT (fabryczny na kartach 64 GB+) na tablicy partycji MBR. GPT
@@ -10,6 +11,7 @@
 // Brak karty albo blad zapisu (karta wyjeta, bez kontaktu, pelna) = stan Error. Co 5 s jest
 // proba ponownego montowania; po udanej nastepny fix zaczyna nowa pare plikow.
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "RaceChronoBle.h"  // rc::GpsFix
@@ -23,7 +25,7 @@ enum class State : int8_t { Off = 0, Error = -1, Disabled = -2, Waiting = 1, Log
 // enabled = false: tylko stan Disabled (czerwone SD), karta nie jest nawet montowana.
 void begin(bool enabled);             // montuje karte SD i startuje zadanie zapisu (rdzen 0)
 void addFix(const rc::GpsFix& fix);   // dopisuje punkt (tylko z fixem)
-void nmeaLine(const char* line);      // dopisuje surowe zdanie NMEA
+void ubxFrame(const uint8_t* frame, size_t len);  // dopisuje cala ramke UBX (0xB5 0x62 ... suma)
 
 State state();
 const char* stateName();
@@ -36,12 +38,16 @@ struct FileInfo {
   char name[48];
   uint32_t size;      // bajty zapisane na karcie (biezacy plik: do ostatniego zapisu, co 2 s)
   char modified[20];  // "RRRR-MM-DD GG:MM" (UTC z GPS)
-  bool active;        // biezaca para zapisu - nie do usuniecia
+  bool active;        // dane wlasnie tu trafiaja (biezaca para albo log) - nie do usuniecia
+  bool recording;     // biezaca para zapisu - nie do pobrania
 };
 bool listOpen();  // false = karta niezamontowana
 bool listNext(FileInfo& out);
 void listClose();
-bool readOpen(const char* name, uint32_t& size);
+// Pobieranie: bez plikow biezacej sesji - odczyt pliku, do ktorego wlasnie dopisuje zadanie zapisu,
+// zawiesil wyswietlacz (watchdog). log.txt mozna (tez dopisywany, ale rzadko).
+bool recording(const char* name);  // plik biezacej pary zapisu
+bool readOpen(const char* name, uint32_t& size);  // false takze dla biezacej sesji
 constexpr int kReadBusy = -2;              // readChunk(): karta zajeta przez zapis - sprobuj znowu
 int readChunk(uint8_t* buf, size_t len);  // liczba bajtow, 0 = koniec, kReadBusy, inne < 0 = blad
 void readClose();

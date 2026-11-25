@@ -1,5 +1,6 @@
 #include "Dashboard.h"
 #include "SysLog.h"
+#include "Version.h"
 
 #include <Arduino.h>
 #include <stdio.h>
@@ -91,6 +92,8 @@ bool changed(Panel& p, const char* key) {
 void push(Panel& p) { p.spr->pushSprite(lcd, p.x, p.y); }
 
 bool otaScreen = false;  // na ekranie jest postep wgrywania przez WiFi
+constexpr uint32_t kSplashMs = 2000;
+uint32_t splashUntil = 0;  // ekran powitalny do tej chwili (0 = juz nie)
 uint32_t blankUntil = 0;  // test zaklocen: do tej chwili ekran wylaczony (0 = nie)
 bool blanked = false;
 
@@ -139,7 +142,10 @@ void drawStatus(const DashData& d) {
   // srodek paska: predkosc, a gdy RC jeszcze nie gotowe - stan polaczenia
   char mid[16];
   uint16_t midCol = COL_TEXT;
-  if (!d.connected) {
+  if (d.safeMode) {
+    snprintf(mid, sizeof(mid), "TRYB AWARYJNY");
+    midCol = COL_RED;
+  } else if (!d.connected) {
     snprintf(mid, sizeof(mid), "Czekam na RC");
     midCol = COL_LABEL;
   } else if (!d.configured) {
@@ -160,7 +166,7 @@ void drawStatus(const DashData& d) {
   bool showSd = d.sdState != 0;
 
   // Prawy rog: satelity uzyte w rozwiazaniu. Przed fixem szare (zwykle 0-3), z fixem + szacowany
-  // blad pozycji z GST (kolor: zielony < 2.5 m, zolty < 5 m, czerwony); bez GST - HDOP jak dawniej.
+  // blad pozycji z NAV-PVT (kolor: zielony < 2.5 m, zolty < 5 m, czerwony); bez niego - HDOP.
   char gq[16] = "";
   char gqShort[8] = "";
   uint16_t gqCol = COL_LABEL;
@@ -321,18 +327,33 @@ void drawTimeRow(Panel& p, const char* label, bool has, int32_t ms, uint16_t val
   push(p);
 }
 
+// Ekran powitalny z wersja programu - widac, co wlasnie wystartowalo (np. po wgraniu przez WiFi).
+// Start idzie w tym czasie dalej, zwykly ekran pojawia sie w update() po kSplashMs.
+void drawSplash() {
+  lcd->fillScreen(COL_BG);
+  lcd->setTextDatum(middle_center);
+  lcd->setFont(&fonts::Font4);
+  lcd->setTextColor(COL_TEXT, COL_BG);
+  lcd->drawString("RC DIY CYD", 120, 120);
+  lcd->setTextColor(strchr(fw::kVersion, '+') ? COL_YELLOW : COL_GREEN, COL_BG);
+  lcd->drawString(fw::kVersion, 120, 165);
+  lcd->setFont(&fonts::Font2);
+  lcd->setTextColor(COL_LABEL, COL_BG);
+  lcd->drawString(fw::kBuilt, 120, 195);
+  splashUntil = (millis() + kSplashMs) | 1;
+}
+
 }  // namespace
 
 void begin(LGFX& display) {
   lcd = &display;
-  lcd->fillScreen(COL_BG);
   fontDelta.loadFont(&fontDeltaData);
   fontTime.loadFont(&fontTimeData);
   createSpr(statusSpr, 240, 24, 8);
   createSpr(bigSpr, 240, kBigH, 16);
   syslog::logf("[UI] wolny RAM %u B, najwiekszy blok %u B\n", (unsigned)ESP.getFreeHeap(),
                (unsigned)ESP.getMaxAllocHeap());
-  drawSeparators();
+  drawSplash();
 }
 
 void showOtaProgress(int percent) {
@@ -362,6 +383,11 @@ uint32_t blankLeftMs() {
 }
 
 void update(const DashData& d) {
+  if (splashUntil) {
+    if ((int32_t)(splashUntil - millis()) > 0) return;
+    splashUntil = 0;
+    otaScreen = true;  // ponizej: zwykly ekran od nowa
+  }
   if (blankLeftMs() > 0) {
     if (!blanked) {
       blanked = true;
@@ -377,7 +403,7 @@ void update(const DashData& d) {
     otaScreen = true;  // ponizej: caly ekran od nowa
     syslog::logf("[TEST] ekran wlaczony\n");
   }
-  if (otaScreen) {  // wgrywanie przerwane albo koniec testu - zwykly ekran od nowa
+  if (otaScreen) {  // po ekranie powitalnym, przerwanym wgrywaniu albo tescie - zwykly ekran od nowa
     otaScreen = false;
     lcd->fillScreen(COL_BG);
     drawSeparators();

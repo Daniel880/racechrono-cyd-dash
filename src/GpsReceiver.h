@@ -1,6 +1,6 @@
 #pragma once
-// Modul GPS (NMEA) na UART. Kazda nowa pozycja trafia jako rc::GpsFix,
-// a kazde surowe zdanie NMEA do gpx::nmeaLine() (backup na SD).
+// Modul GPS u-blox M10 na UART, protokol UBX. Kazda nowa pozycja (UBX-NAV-PVT) trafia jako
+// rc::GpsFix, a kazda ramka UBX z modulu do gpx::ubxFrame() (surowy zapis na SD do analizy).
 
 #include <stdint.h>
 
@@ -12,11 +12,9 @@ enum class State : int8_t { Off = 0, NoData = 1, NoFix = 2, Fix = 3 };
 
 // Jakosc odbioru do wskaznika na ekranie
 struct Quality {
-  uint8_t used;     // satelity uzyte w fixie (GGA), 0 bez fixa
-  uint8_t tracked;  // satelity z sygnalem (GSV) - rosnie juz przed fixem
-  float hdop;       // 0 = brak
-  uint8_t fix;      // pole 6 GGA: 0 brak, 1 GPS, 2 SBAS/DGPS
-  float accM;       // szacowany blad pozycji poziomej [m] z GST, 0 = brak
+  uint8_t used;  // satelity uzyte w rozwiazaniu (NAV-PVT numSV), 0 = brak danych
+  float hdop;    // NAV-DOP, 0 = brak (bez fixa)
+  float accM;    // szacowany blad pozycji poziomej [m] (NAV-PVT hAcc), 0 = brak (bez fixa)
 };
 
 // ---------- Diagnostyka (strona /gps) ----------
@@ -38,11 +36,10 @@ struct Diag {
   uint8_t rateLen;
   uint32_t epochs;       // epoki od startu (w normalnej pracy)
   uint32_t missed;       // zgubione epoki: luka w czasie z modulu wieksza niz okres pomiaru
-  uint32_t missedDiag;   // w tym przy wlaczonych komunikatach diagnostycznych (otwarta strona /gps)
   uint32_t gaps;         // przerwy w danych dluzsze niz 3 s
   uint32_t firstFixMs;   // pierwszy fix: ms od startu ESP, 0 = jeszcze nie bylo
   uint32_t fixLost;      // ile razy fix zniknal
-  // Z komunikatow UBX - tylko przy otwartej stronie /gps. Wiek w ms, UINT32_MAX = brak danych.
+  // Z komunikatow UBX raz na sekunde. Wiek w ms, UINT32_MAX = brak danych.
   uint32_t satAge, rfAge, navAge;
   uint8_t numSats;
   SatInfo sats[kMaxSats];
@@ -56,7 +53,6 @@ struct Diag {
   uint32_t navMsss;      // NAV-STATUS: czas od startu modulu [ms]
 };
 void stop();           // przed wgrywaniem programu: konczy UART (update() juz nie wolac)
-void requestDiag();    // strona /gps: dodatkowe komunikaty z modulu (UBX) przez nastepne 30 s
 void diag(Diag& out);  // kopia z innego zadania (strona WWW)
 
 void begin(uint8_t gpsMode);  // 25 / 20 / 10 - patrz Settings.h

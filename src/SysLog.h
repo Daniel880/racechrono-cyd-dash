@@ -5,8 +5,9 @@
 // wiec po awarii mozna przeczytac ostatnie komunikaty sprzed restartu bez kabla USB.
 //
 // Ochrona przed petla restartow: gdy dwa kolejne uruchomienia skonczyly sie bledem w ciagu
-// kStableMs od startu, safeMode() = true i main.cpp nie wlacza zapisu na SD (najczestszy
-// podejrzany). Wyswietlacz, GPS, Bluetooth i WiFi dzialaja, na stronie widac log awarii.
+// kStableMs od startu, safeMode() = true i main.cpp uruchamia tylko ekran i WiFi (bez GPS,
+// Bluetooth i zapisu na SD) - obudowa jest zaklejona, wiec poprawke da sie wgrac tylko przez WiFi.
+// Na stronie widac log awarii.
 // Wylaczenie i wlaczenie zasilania albo restart programowy (np. po wgraniu programu) kasuje licznik.
 
 #include <stddef.h>

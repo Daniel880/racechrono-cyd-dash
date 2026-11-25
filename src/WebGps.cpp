@@ -19,7 +19,7 @@ namespace {
 
 WebServer* srv = nullptr;
 constexpr uint32_t kTestMs = 20000;
-constexpr uint32_t kFreshMs = 5000;  // starsze dane UBX = brak (strona dopiero otwarta)
+constexpr uint32_t kFreshMs = 5000;  // starsze dane UBX (przychodza raz na sekunde) = brak
 
 // Satelity w JSON: [system, nr, C/N0, wysokosc, flagi] - znaczenie flag w gpsrx::SatInfo.
 const char kBody[] = R"html(<p><a href='/'>Start</a> &middot; <a href='/files'>Pliki</a> &middot; <a href='/log'>Log</a></p>
@@ -70,7 +70,7 @@ async function poll(){let d;
  let s=R('Tryb',d.hz+' Hz ('+d.mode+')'+(d.run?'':' - modul w konfiguracji'));
  if(r.length){s+=R('Epoki na sekunde','min '+Math.min(...r)+', srednio '+avg(r).toFixed(2)+', max '+
   Math.max(...r)+' (ostatnie '+r.length+' s)');s+=R('Ostatnie 15 s',r.slice(-15).join(' '))}
- s+=R('Zgubione epoki',d.miss+' z '+d.ep+(d.missD?' (w tym '+d.missD+' przy otwartej tej stronie)':'')+
+ s+=R('Zgubione epoki',d.miss+' z '+d.ep+
   (d.gaps?'; przerwy w danych ponad 3 s: '+d.gaps:''));
  let b=d.ble.c?'polaczone':'nie polaczone';
  if(d.ble.c&&prev&&prev.ble.c){const dt=(d.up-prev.up)/1000;
@@ -90,7 +90,7 @@ async function poll(){let d;
  if(d.sat){s+=R('C/N0 4 najmocniejszych',top4?top4.toFixed(1)+' dBHz':'-');
   s+=R('C/N0 uzytych, srednio',us.length?avg(us.map(x=>x[2])).toFixed(1)+' dBHz':'-');
   s+=R('Satelity','uzyte '+us.length+', slyszane '+tr.length+', na liscie '+L.length)}
- else s+=R('Satelity','czekam na dane z modulu (kilka sekund po otwarciu strony)');
+ else s+=R('Satelity','brak danych z modulu');
  if(d.rf)s+=R('Wejscie radiowe','szum '+d.rf.noise+', AGC '+d.rf.agc+' / 8191, zaklocenia waskopasmowe '+
   d.rf.cw+' / 255, detektor zaklocen: '+JAM[d.rf.jam]+', antena: '+(ANT[d.rf.ant]||d.rf.ant));
  tS.innerHTML=s;
@@ -115,7 +115,6 @@ setInterval(poll,1000);poll();
 </script></body></html>)html";
 
 void handlePage() {
-  gpsrx::requestDiag();  // modul zaczyna wysylac dane satelitow juz przy otwieraniu strony
   WebServer& s = *srv;
   s.setContentLength(CONTENT_LENGTH_UNKNOWN);
   s.send(200, "text/html", "");
@@ -125,7 +124,6 @@ void handlePage() {
 }
 
 void handleJson() {
-  gpsrx::requestDiag();
   static gpsrx::Diag d;  // ~650 B - nie na stosie zadania loop
   gpsrx::diag(d);
   const gpsrx::Quality q = gpsrx::quality();
@@ -150,8 +148,6 @@ void handleJson() {
   j += d.epochs;
   j += ",\"miss\":";
   j += d.missed;
-  j += ",\"missD\":";
-  j += d.missedDiag;
   j += ",\"gaps\":";
   j += d.gaps;
   j += ",\"ff\":";

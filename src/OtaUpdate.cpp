@@ -7,10 +7,12 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_ota_ops.h>
 
 #include "GpxLogger.h"
 #include "Settings.h"
 #include "SysLog.h"
+#include "Version.h"
 #include "WebPages.h"
 
 #ifndef OTA_PASSWORD
@@ -28,6 +30,12 @@ td,th{padding:2px 8px 2px 0;vertical-align:top;text-align:left}th{border-bottom:
 </style></head><body><h2>RC DIY CYD</h2>)html";
 }  // namespace web
 
+// Nowo wgrany program jest zatwierdzany dopiero po kConfirmMs pracy z dzialajacym WiFi (loop()).
+// Restart wczesniej - awaria, watchdog, wylaczenie zasilania - i bootloader sam wraca do
+// poprzedniego programu. Obudowa jest zaklejona, wiec WiFi to jedyna droga wgrywania: zly program
+// nie moze jej odciac. Domyslnie Arduino zatwierdza kazdy program od razu przy starcie.
+extern "C" bool verifyRollbackLater() { return true; }
+
 namespace ota {
 namespace {
 
@@ -36,6 +44,7 @@ using web::kHead;
 constexpr const char* kSsid = "RC-CYD-OTA";
 constexpr uint32_t kWindowMs = 30000;      // bez nikogo podlaczonego: tyle po starcie i po rozlaczeniu
 constexpr uint32_t kMaxOnMs = 15 * 60000;  // twardy limit wlaczonego WiFi (zapomniany laptop)
+constexpr uint32_t kConfirmMs = 20000;     // tyle pracy bez awarii zatwierdza nowo wgrany program
 
 
 const char kFirmware[] = R"html(<h3>Nowy program</h3>
@@ -59,6 +68,55 @@ bool webOk = false;  // biezace wgrywanie ze strony idzie bez bledu
 void (*progressCb)(int) = nullptr;
 void (*updateStartCb)() = nullptr;
 bool updateMode = false;  // GPS, zapis SD i Bluetooth zatrzymane - koniec tylko przez restart
+bool pendingVerify = false;  // biezacy program swiezo wgrany, jeszcze niezatwierdzony
+
+bool isPendingVerify() {
+  esp_ota_img_states_t s;
+  return esp_ota_get_state_partition(esp_ota_get_running_partition(), &s) == ESP_OK &&
+         s == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+// W trybie awaryjnym WiFi czeka na podlaczenie do limitu 15 min - jest po to, zeby wgrac poprawke.
+uint32_t windowMs() { return syslog::safeMode() ? kMaxOnMs : kWindowMs; }
+
+// ---------- Partycje programu (diagnostyka: wyswietlacz sam wrocil kiedys do starego programu) ----------
+const char* otaStateName(const esp_partition_t* p) {
+  esp_ota_img_states_t s;
+  if (!p || esp_ota_get_state_partition(p, &s) != ESP_OK) return "bez wpisu";
+  switch (s) {
+    case ESP_OTA_IMG_NEW: return "nowy";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "w probie";
+    case ESP_OTA_IMG_VALID: return "zatwierdzony";
+    case ESP_OTA_IMG_INVALID: return "odrzucony";
+    case ESP_OTA_IMG_ABORTED: return "przerwany";
+    default: return "bez stanu";
+  }
+}
+
+// "app1 zatwierdzony, elf 1a2b3c4d" - elf = poczatek SHA-256 programu, inny w kazdej kompilacji
+void partInfo(const esp_partition_t* p, char* out, size_t len) {
+  esp_app_desc_t d;
+  if (!p) {
+    snprintf(out, len, "?");
+  } else if (esp_ota_get_partition_description(p, &d) == ESP_OK) {
+    snprintf(out, len, "%s %s, elf %02x%02x%02x%02x", p->label, otaStateName(p), d.app_elf_sha256[0],
+             d.app_elf_sha256[1], d.app_elf_sha256[2], d.app_elf_sha256[3]);
+  } else {
+    snprintf(out, len, "%s %s, bez programu", p->label, otaStateName(p));
+  }
+}
+
+// Dziala / druga partycja i ta, ktora wskazuje tablica startowa (otadata). Rozne "dziala" i "start"
+// = bootloader nie uruchomil wskazanego programu (np. nie przeszedl sprawdzenia sumy kontrolnej).
+void partitionsText(char* out, size_t len) {
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  const esp_partition_t* boot = esp_ota_get_boot_partition();
+  char a[48], b[48];
+  partInfo(run, a, sizeof(a));
+  partInfo(esp_ota_get_next_update_partition(nullptr), b, sizeof(b));
+  snprintf(out, len, "dziala %s; druga %s%s%s", a, b, boot && boot != run ? "; UWAGA: start wskazywal " : "",
+           boot && boot != run ? boot->label : "");
+}
 
 // Tryb wgrywania: zwolnienie RAM-u przed przyjmowaniem pliku. Przy samym WiFi, BLE, GPS i SD
 // zostaje ~24 kB w kawalkach, a wgrywanie potrzebuje kilkunastu kB naraz (bufory WiFi + zapisu).
@@ -109,10 +167,17 @@ void row(String& h, const char* name, const String& value, bool err = false) {
 void statusSection(String& h) {
   h += "<h3>Stan</h3>";
   if (syslog::safeMode())
-    h += "<p class='err'>TRYB AWARYJNY: wyswietlacz restartowal sie tuz po starcie, wiec zapis na SD jest "
-         "wylaczony. Przyczyna w logu ponizej. Wylacz i wlacz zasilanie, zeby sprobowac ponownie.</p>";
+    h += "<p class='err'>TRYB AWARYJNY: wyswietlacz restartowal sie tuz po starcie, wiec dziala tylko ekran i "
+         "WiFi (bez GPS, Bluetooth i zapisu na SD). Przyczyna w logu ponizej. Wgraj poprawiony program albo "
+         "wylacz i wlacz zasilanie, zeby sprobowac ponownie.</p>";
   h += "<table>";
-  row(h, "Program", __DATE__ " " __TIME__);
+  row(h, "Program", String(fw::kVersion) + ", kompilacja " + fw::kBuilt);
+  char parts[160];
+  partitionsText(parts, sizeof(parts));
+  row(h, "Partycje", parts, strstr(parts, "UWAGA") != nullptr);
+  if (pendingVerify) row(h, "Nowy program", "w probie - zatwierdzenie po 20 s pracy");
+  if (esp_ota_get_last_invalid_partition())
+    row(h, "Ostatnie wgranie", "program nie przeszedl proby (restart w ciagu 20 s) - dziala poprzedni", true);
   row(h, "Dziala od", uptime());
   const gpx::State sd = gpx::state();
   const bool crash = syslog::crashCount() > 0;
@@ -136,13 +201,17 @@ void handleLog() {
   }
   String t;
   t.reserve(2 * syslog::kBufBytes + 600);
-  t += "RC DIY CYD - program " __DATE__ " " __TIME__ ", dziala od ";
+  t += "RC DIY CYD - program ";
+  t += fw::kVersion;
+  t += ", kompilacja ";
+  t += fw::kBuilt;
+  t += ", dziala od ";
   t += uptime();
   t += "\nKarta SD: ";
   t += gpx::stateName();
   t += "\nAwarie z rzedu: ";
   t += syslog::crashCount();
-  t += syslog::safeMode() ? " - TRYB AWARYJNY, zapis na SD wylaczony\n" : "\n";
+  t += syslog::safeMode() ? " - TRYB AWARYJNY: tylko ekran i WiFi\n" : "\n";
   t += "\n=== BIEZACE URUCHOMIENIE ===\n";
   syslog::copy(false, buf);
   t += buf;
@@ -204,7 +273,7 @@ void handleSettings() {
   server.sendHeader("Connection", "close");
   server.send(200, "text/html",
               String(kHead) + "<p>Zapisano. Wyswietlacz uruchamia sie ponownie - siec WiFi bedzie znow "
-                              "dostepna przez " + String(kWindowMs / 1000) + " s.</p></body></html>");
+                              "dostepna przez " + String(windowMs() / 1000) + " s.</p></body></html>");
   restartSoon();
 }
 
@@ -249,12 +318,24 @@ void handleUploadDone() {
 void begin(void (*onProgress)(int), void (*onUpdateStart)()) {
   progressCb = onProgress;
   updateStartCb = onUpdateStart;
+  pendingVerify = isPendingVerify();
+  char parts[160];
+  partitionsText(parts, sizeof(parts));
+  syslog::logf("[OTA] partycje: %s\n", parts);
+  if (pendingVerify)
+    syslog::logf("[OTA] nowo wgrany program - zatwierdzenie po %lu s pracy, wczesniejszy restart wraca do "
+                 "poprzedniego\n",
+                 (unsigned long)(kConfirmMs / 1000));
   WiFi.persistent(false);  // bez zapisywania ustawien WiFi we flash
   // max 1 urzadzenie: drugie (np. telefon, ktory sam dolacza do znanej sieci) zajmowaloby RAM
   // na bufory WiFi, a tego brakuje przy pobieraniu plikow
   if (!WiFi.mode(WIFI_AP) || !WiFi.softAP(kSsid, OTA_PASSWORD, 1, 0, 1)) {
     syslog::logf("[OTA] nie moge uruchomic WiFi (wolny RAM %u B)\n", (unsigned)ESP.getFreeHeap());
     WiFi.mode(WIFI_OFF);
+    if (pendingVerify) {  // bez WiFi nie daloby sie wgrac poprawki
+      syslog::logf("[OTA] nowy program bez WiFi - powrot do poprzedniego\n");
+      esp_ota_mark_app_invalid_rollback_and_reboot();
+    }
     return;
   }
 
@@ -294,10 +375,16 @@ void begin(void (*onProgress)(int), void (*onUpdateStart)()) {
   startMs = lastClientMs = millis();
   st = State::Window;
   syslog::logf("[OTA] siec WiFi \"%s\" przez %lu s, strona: http://%s/ (stan, log, ustawienia, wgrywanie)\n",
-               kSsid, (unsigned long)(kWindowMs / 1000), WiFi.softAPIP().toString().c_str());
+               kSsid, (unsigned long)(windowMs() / 1000), WiFi.softAPIP().toString().c_str());
 }
 
 void loop() {
+  if (pendingVerify && !updateMode && millis() >= kConfirmMs) {
+    pendingVerify = false;
+    const bool ok = esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
+    syslog::logf("[OTA] nowy program zatwierdzony (%lu s bez awarii, WiFi dziala)%s\n",
+                 (unsigned long)(kConfirmMs / 1000), ok ? "" : " - BLAD zapisu zatwierdzenia");
+  }
   if (st == State::Off) return;
   // Wgrywanie (z PlatformIO albo ze strony) trwa w srodku tych wywolan; po sukcesie restart.
   ArduinoOTA.handle();
@@ -316,7 +403,7 @@ void loop() {
     st = State::Window;
   }
   // 30 s po starcie albo po rozlaczeniu ostatniego urzadzenia - WiFi wylaczone.
-  if (now - lastClientMs > kWindowMs)
+  if (now - lastClientMs > windowMs())
     stop("nikt nie jest podlaczony");
   else if (now - startMs > kMaxOnMs)
     stop("limit 15 min");

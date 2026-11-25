@@ -5,6 +5,8 @@
 #include <esp_system.h>
 #include <stdarg.h>
 
+#include "Version.h"
+
 namespace syslog {
 namespace {
 
@@ -68,13 +70,14 @@ void begin() {
   rtc.stable = 0;
   rtc.magic = kMagic;
 
-  logf("[SYS] start, poprzednie uruchomienie: %s\n", resetReason());
+  logf("[SYS] start, program %s (kompilacja %s), poprzednie uruchomienie: %s\n", fw::kVersion, fw::kBuilt,
+       resetReason());
   if (safe)
-    logf("[SYS] TRYB AWARYJNY: %u awarie z rzedu tuz po starcie - zapis na SD wylaczony "
-         "(wylacz i wlacz zasilanie, zeby sprobowac ponownie)\n",
+    logf("[SYS] TRYB AWARYJNY: %u awarie z rzedu tuz po starcie - tylko ekran i WiFi, bez GPS, Bluetooth "
+         "i SD (wgraj poprawke albo wylacz i wlacz zasilanie, zeby sprobowac ponownie)\n",
          (unsigned)rtc.crashes);
   else if (rtc.crashes)
-    logf("[SYS] awaria nr %u z rzedu; po %u tryb awaryjny bez SD\n", (unsigned)rtc.crashes,
+    logf("[SYS] awaria nr %u z rzedu; po %u tryb awaryjny (tylko ekran i WiFi)\n", (unsigned)rtc.crashes,
          (unsigned)kSafeAfter);
 }
 

@@ -54,7 +54,8 @@ void handleList() {
   const bool blocked = rc::isConnected();
   String t = "<p>Karta ";
   t += String(gpx::cardMB() / 1024.0f, 1);
-  t += " GB. Czas zmiany plikow: UTC z GPS. Biezacy plik ma na karcie dane sprzed najwyzej 2 s.</p>";
+  t += " GB. Czas zmiany plikow: UTC z GPS. Pliki biezacej sesji (zapis trwa) mozna pobrac po nastepnym "
+       "wlaczeniu wyswietlacza.</p>";
   if (blocked) t += kBlockedHtml;
   t += "<table><thead><tr><th>Plik</th><th>Rozmiar</th><th>Zmieniony</th><th></th></tr></thead><tbody id='fl'>";
   s.sendContent(t);
@@ -65,7 +66,7 @@ void handleList() {
     count++;
     total += fi.size;
     // nazwy sprawdzone w gpx (litery, cyfry, - _ .) - bezpieczne w HTML, URL i JS
-    if (blocked) {
+    if (blocked || fi.recording) {
       t = "<tr><td>";
       t += fi.name;
     } else {
@@ -94,7 +95,7 @@ void handleList() {
   }
   // Karta podaje pliki w kolejnosci katalogu, a sortowanie tutaj wymagaloby trzymania calej listy
   // w RAM (brakuje go dla WiFi) - sortuje przegladarka: log.txt, log_old.txt, potem sesje od
-  // najnowszej (nazwa = data i czas startu, wiec malejaco po nazwie), w parze .gpx przed .nmea.
+  // najnowszej (nazwa = data i czas startu, wiec malejaco po nazwie), w parze .gpx przed .ubx.
   t = "</tbody></table><script>(()=>{const k=n=>{const i=n.lastIndexOf('.');"
       "return[n.startsWith('log')?0:1,i<0?n:n.slice(0,i),i<0?'':n.slice(i)]};"
       "const c=(a,b)=>a<b?-1:a>b?1:0;"
@@ -127,6 +128,12 @@ void handleDownload() {
     s.send(409, "text/html", String(kHead) + kBlockedHtml + "<p><a href='/files'>Pliki</a></p></body></html>");
     return;
   }
+  if (gpx::recording(name.c_str())) {
+    s.send(409, "text/html",
+           String(kHead) + "<p class='err'>Ten plik jest teraz zapisywany - pobierzesz go po nastepnym wlaczeniu "
+                           "wyswietlacza.</p><p><a href='/files'>Pliki</a></p></body></html>");
+    return;
+  }
   uint32_t size = 0;
   if (!gpx::readOpen(name.c_str(), size)) {
     s.send(404, "text/plain", "Nie ma takiego pliku albo karta niedostepna");
@@ -140,10 +147,12 @@ void handleDownload() {
   }
   syslog::logf("[WWW] pobieranie %s (%lu kB), wolny RAM %u B\n", name.c_str(), (unsigned long)(size / 1024),
                (unsigned)ESP.getFreeHeap());
-  const bool gpxFile = name.endsWith(".gpx");
+  const char* type = name.endsWith(".gpx")   ? "application/gpx+xml"
+                     : name.endsWith(".ubx") ? "application/octet-stream"
+                                             : "text/plain";
   s.setContentLength(size);
   s.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
-  s.send(200, gpxFile ? "application/gpx+xml" : "text/plain", "");
+  s.send(200, type, "");
 
   // Kawalkami: blokada karty tylko na czas odczytu, zapis trasy idzie w tym czasie dalej.
   // Zapisujemy tez, gdzie szedl czas (karta / WiFi) - do diagnozy w logu.

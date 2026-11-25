@@ -25,15 +25,15 @@ constexpr uint32_t kSdMhz = 20;
 constexpr const char* kDir = "/gpx";
 constexpr uint32_t kSyncEveryMs = 2000;   // zapis na karte i rozmiaru pliku w katalogu
 constexpr uint32_t kRetryMountMs = 5000;  // brak karty / blad zapisu: kolejna proba montowania
-constexpr size_t kQueueBytes = 10240;     // ~1.5 s danych przy 25 Hz (RMC + GGA + punkt na pomiar)
+constexpr size_t kQueueBytes = 10240;     // ~1.5 s danych przy 25 Hz (NAV-PVT + NAV-DOP + punkt na pomiar)
 constexpr size_t kOutBytes = 2048;        // bufor kazdego pliku w RAM
 
 const char kFooter[] = "</trkseg></trk></gpx>\n";
 
-// addFix()/nmeaLine() sa wolane z zadania GPS i tylko wrzucaja dane do kolejki;
+// addFix()/ubxFrame() sa wolane z zadania GPS i tylko wrzucaja dane do kolejki;
 // na karte zapisuje osobne zadanie na rdzeniu 0. Dzieki temu wolny zapis karty SD
 // (potrafi trwac kilkadziesiat ms) nie opoznia ani GPS, ani rysowania ekranu.
-enum ItemType : uint8_t { ItemFix = 1, ItemNmea = 2, ItemLog = 3 };
+enum ItemType : uint8_t { ItemFix = 1, ItemUbx = 2, ItemLog = 3 };
 
 // Log systemowy (SysLog) na karcie: przetrwa wylaczenie zasilania, do pobrania na /files.
 constexpr const char* kLogPath = "/gpx/log.txt";
@@ -53,7 +53,7 @@ struct Out {
 SPIClass sdSpi(VSPI);
 SdFs sd;
 Out gpxOut;
-Out nmeaOut;
+Out ubxOut;
 FsFile logFile;
 bool logDirty = false;
 bool bootLogged = false;  // wpisy sprzed pierwszego zamontowania karty juz w pliku
@@ -76,8 +76,6 @@ SemaphoreHandle_t mtx = nullptr;
 uint32_t mountGen = 0;
 FsFile webDir, webFile;
 uint32_t webDirGen = 0, webFileGen = 0;
-uint32_t webPos = 0;                // pozycja odczytu pliku dla strony
-uint32_t webFooterAt = UINT32_MAX;  // biezacy GPX: od tej pozycji stopka doklejana w locie
 bool webDirOpen = false;
 
 // shutdown(): zadanie zapisu konczy sie samo na poczatku petli (nie w polowie zapisu).
@@ -117,14 +115,14 @@ void put(Out& o, const char* s) { put(o, s, strlen(s)); }
 
 // Zapis na karte i rozmiaru pliku w katalogu. Bufor zawsze konczy sie na pelnym wpisie, wiec po
 // sync plik GPX to naglowek i pelne punkty - bez stopki. Sesja konczy sie wylaczeniem zasilania,
-// wiec stopke dopisuje repairGpx() przy nastepnym zamontowaniu karty, a przy pobieraniu
-// biezacego pliku readChunk() dokleja ja w locie. (Stopka pisana co sync i nadpisywana nowymi
-// punktami nie dzialala: rozmiar w katalogu zostawal stary, a jej miejsce zajmowaly juz punkty.)
+// wiec stopke dopisuje repairGpx() przy nastepnym zamontowaniu karty (biezacej sesji nie da sie
+// pobrac). (Stopka pisana co sync i nadpisywana nowymi punktami nie dzialala: rozmiar w katalogu
+// zostawal stary, a jej miejsce zajmowaly juz punkty.)
 void syncFiles() {
   drain(gpxOut);
   if (writeOk && !gpxOut.f.sync()) writeOk = false;
-  drain(nmeaOut);
-  if (writeOk && !nmeaOut.f.sync()) writeOk = false;
+  drain(ubxOut);
+  if (writeOk && !ubxOut.f.sync()) writeOk = false;
 }
 
 constexpr size_t kFooterLen = sizeof(kFooter) - 1;
@@ -241,8 +239,8 @@ bool mount() {
 
 void closeFiles() {
   gpxOut.f.close();
-  nmeaOut.f.close();
-  gpxOut.len = nmeaOut.len = 0;
+  ubxOut.f.close();
+  gpxOut.len = ubxOut.len = 0;
 }
 
 // Blad karty: zamykamy pliki i odmontowujemy. Zadanie zapisu co kRetryMountMs probuje
@@ -264,7 +262,7 @@ bool openNewFiles(const rc::GpsFix& f) {
   syslog::logf("[GPX] pierwszy fix - tworze pliki\n");
   fileTime = f;
   if (!sd.exists(kDir) && !sd.mkdir(kDir)) return false;
-  char stamp[32], gpxPath[64], nmeaPath[64];  // zapas: kompilator liczy pola uint8_t jako 0..255
+  char stamp[32], gpxPath[64], ubxPath[64];  // zapas: kompilator liczy pola uint8_t jako 0..255
   snprintf(stamp, sizeof(stamp), "%04u-%02u-%02u_%02u-%02u-%02u", f.year, f.month, f.day, f.hour, f.minute,
            f.second);
   for (int n = 1; n <= 99; n++) {
@@ -273,12 +271,12 @@ bool openNewFiles(const rc::GpsFix& f) {
     else
       snprintf(baseName, sizeof(baseName), "%s_%d", stamp, n);
     snprintf(gpxPath, sizeof(gpxPath), "%s/%s.gpx", kDir, baseName);
-    snprintf(nmeaPath, sizeof(nmeaPath), "%s/%s.nmea", kDir, baseName);
-    if (sd.exists(gpxPath) || sd.exists(nmeaPath)) continue;
+    snprintf(ubxPath, sizeof(ubxPath), "%s/%s.ubx", kDir, baseName);
+    if (sd.exists(gpxPath) || sd.exists(ubxPath)) continue;
 
-    gpxOut.len = nmeaOut.len = 0;
+    gpxOut.len = ubxOut.len = 0;
     const bool opened = gpxOut.f.open(gpxPath, O_WRONLY | O_CREAT | O_EXCL) &&
-                        nmeaOut.f.open(nmeaPath, O_WRONLY | O_CREAT | O_EXCL);
+                        ubxOut.f.open(ubxPath, O_WRONLY | O_CREAT | O_EXCL);
     if (opened) {
       put(gpxOut,
           "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -294,11 +292,11 @@ bool openNewFiles(const rc::GpsFix& f) {
       // np. pelna karta - bez zostawiania pustych plikow po kazdej nieudanej probie
       closeFiles();
       sd.remove(gpxPath);
-      sd.remove(nmeaPath);
+      sd.remove(ubxPath);
       baseName[0] = '\0';
       return false;
     }
-    syslog::logf("[GPX] zapis do %s i %s\n", gpxPath, nmeaPath);
+    syslog::logf("[GPX] zapis do %s i %s\n", gpxPath, ubxPath);
     lastSyncMs = millis();
     firstSyncLogged = false;
     return true;
@@ -350,9 +348,8 @@ void writeQueued() {
       rc::GpsFix f;
       memcpy(&f, item + 1, sizeof(f));
       writeFix(f);
-    } else if (item[0] == ItemNmea && st == State::Logging) {
-      put(nmeaOut, item + 1, size - 1);
-      put(nmeaOut, "\r\n", 2);
+    } else if (item[0] == ItemUbx && st == State::Logging) {
+      put(ubxOut, item + 1, size - 1);
     } else if (item[0] == ItemLog && logFile.isOpen() && writeOk) {
       if (logFile.write(item + 1, size - 1) != size - 1) writeOk = false;
       logDirty = true;
@@ -444,13 +441,15 @@ bool validName(const char* n) {
   return true;
 }
 
-// Plik biezacej pary zapisu ("<baseName>.gpx" / ".nmea") - wolac pod blokada.
-bool isActive(const char* n) {
-  if (logFile.isOpen() && strcmp(n, kLogName) == 0) return true;  // log jest dopisywany na biezaco
+// Plik biezacej pary zapisu ("<baseName>.gpx" / ".ubx") - wolac pod blokada.
+bool isSession(const char* n) {
   if (st != State::Logging || !baseName[0]) return false;
   const size_t len = strlen(baseName);
   return strncmp(n, baseName, len) == 0 && n[len] == '.';
 }
+
+// Plik, do ktorego teraz trafiaja dane: biezaca para albo log (dopisywany na biezaco).
+bool isActive(const char* n) { return isSession(n) || (logFile.isOpen() && strcmp(n, kLogName) == 0); }
 
 // SysLog -> kolejka -> plik logu (zadanie zapisu). Z dowolnego zadania; bez kopii na stosie,
 // bo loguja tez callbacki Bluetooth z malym stosem.
@@ -508,9 +507,18 @@ void addFix(const rc::GpsFix& f) {
   enqueue(ItemFix, &f, sizeof(f));
 }
 
-void nmeaLine(const char* line) {
-  if (st != State::Logging) return;
-  enqueue(ItemNmea, line, strlen(line));
+// Ramka do 1 kB - prosto do kolejki, bez kopii na stosie zadania GPS.
+void ubxFrame(const uint8_t* frame, size_t len) {
+  if (!queue || st != State::Logging) return;
+  void* p = nullptr;
+  if (xRingbufferSendAcquire(queue, &p, 1 + len, 0) != pdTRUE || !p) {
+    dropped = dropped + 1;
+    return;
+  }
+  uint8_t* b = (uint8_t*)p;
+  b[0] = ItemUbx;
+  memcpy(b + 1, frame, len);
+  xRingbufferSendComplete(queue, p);
 }
 
 State state() { return st; }
@@ -541,6 +549,7 @@ bool listNext(FileInfo& out) {
           snprintf(out.modified, sizeof(out.modified), "%04u-%02u-%02u %02u:%02u", FS_YEAR(d), FS_MONTH(d),
                    FS_DAY(d), FS_HOUR(t), FS_MINUTE(t));
         out.active = isActive(out.name);
+        out.recording = isSession(out.name);
         found = true;
       }
       f.close();
@@ -561,23 +570,25 @@ void listClose() {
   unlock();
 }
 
+bool recording(const char* name) {
+  if (!lock()) return false;
+  const bool r = isSession(name);
+  unlock();
+  return r;
+}
+
 bool readOpen(const char* name, uint32_t& size) {
   if (!validName(name) || !lock()) return false;
   char path[64];
   snprintf(path, sizeof(path), "%s/%s", kDir, name);
   webFile.close();
-  bool ok = mounted() && webFile.open(path, O_RDONLY) && !webFile.isDir();
+  // Biezaca sesja nie: pobieranie pliku, do ktorego zadanie zapisu wlasnie dopisuje, zawiesilo
+  // wyswietlacz (watchdog). Pliki poprzednich sesji sa zamkniete.
+  bool ok = mounted() && !isSession(name) && webFile.open(path, O_RDONLY) && !webFile.isDir();
   if (ok) {
     const uint64_t s = webFile.fileSize();
     size = s > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)s;
     webFileGen = mountGen;
-    webPos = 0;
-    webFooterAt = UINT32_MAX;
-    const size_t len = strlen(name);
-    if (isActive(name) && len > 4 && strcmp(name + len - 4, ".gpx") == 0) {
-      webFooterAt = size;  // plik konczy sie na pelnym punkcie (stan z ostatniego zapisu)
-      size += kFooterLen;
-    }
   } else {
     webFile.close();
   }
@@ -588,17 +599,7 @@ bool readOpen(const char* name, uint32_t& size) {
 int readChunk(uint8_t* buf, size_t len) {
   if (!lock()) return kReadBusy;
   int n = -1;
-  if (mounted() && webFileGen == mountGen && webFile.isOpen()) {
-    if (webPos >= webFooterAt) {
-      const uint32_t off = webPos - webFooterAt;
-      n = off < kFooterLen ? (int)(len < kFooterLen - off ? len : kFooterLen - off) : 0;
-      memcpy(buf, kFooter + off, n);
-    } else {
-      const uint32_t left = webFooterAt - webPos;  // UINT32_MAX = caly plik
-      n = webFile.read(buf, len < left ? len : left);
-    }
-    if (n > 0) webPos += n;
-  }
+  if (mounted() && webFileGen == mountGen && webFile.isOpen()) n = webFile.read(buf, len);
   unlock();
   return n;
 }
@@ -688,12 +689,13 @@ uint32_t pauseLeftMs() {
 namespace gpx {
 void begin(bool) {}
 void addFix(const rc::GpsFix&) {}
-void nmeaLine(const char*) {}
+void ubxFrame(const uint8_t*, size_t) {}
 State state() { return State::Off; }
 const char* fileName() { return ""; }
 bool listOpen() { return false; }
 bool listNext(FileInfo&) { return false; }
 void listClose() {}
+bool recording(const char*) { return false; }
 bool readOpen(const char*, uint32_t&) { return false; }
 int readChunk(uint8_t*, size_t) { return -1; }
 void readClose() {}

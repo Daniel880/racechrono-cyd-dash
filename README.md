@@ -6,7 +6,7 @@ Wyswietlacz do [RaceChrono](https://racechrono.com) na plytce ESP32 "Cheap Yello
 
 - pokazuje delte czasu i predkosci do okrazenia porownawczego oraz czasy okrazen (Monitor API),
 - wysyla do RaceChrono pozycje z zewnetrznego modulu GPS u-blox M10 (do 25 Hz),
-- zapisuje kopie trasy na karte microSD (GPX + surowe NMEA), niezalezna od telefonu.
+- zapisuje kopie trasy na karte microSD (GPX + surowe dane z modulu GPS), niezalezna od telefonu.
 
 ## Sprzet
 
@@ -30,6 +30,11 @@ w `include/LGFX_CYD.h`.
 | BEST #7                1:22.98   |  najlepsze (albo REF, gdy delta liczona jest do innego)
 ```
 
+Przy starcie przez 2 s ekran powitalny z wersja programu: krotki hash commita z gita (zolty
+z dopiskiem `+zmiany`, gdy program zbudowano z niezacommitowanych zmian) i data kompilacji. Ta sama
+wersja jest na stronie Stan i w logu (`[SYS] start, program ...`). Wersje wpisuje `tools/version.py`
+przy kazdej kompilacji.
+
 - Kropka: szara - brak polaczenia z RaceChrono, zolta - rejestracja monitorow, zielona - gotowe.
 - `GPS`: szary - brak poprawnych danych z modulu, zolty - brak fixa, zielony - fix.
 - `SD`: czerwony - brak karty albo blad zapisu (ponowna proba co 5 s) albo tryb awaryjny
@@ -51,19 +56,34 @@ Flagi w `build_flags` w `platformio.ini`:
 
 | Flaga | Znaczenie |
 |---|---|
-| `GPX_LOG` | backup na SD: `/gpx/RRRR-MM-DD_GG-MM-SS.gpx` i `.nmea` (czas UTC pierwszego fixa) |
-| `GPS_UART_RX`, `GPS_UART_TX` | piny UART modulu GPS; bez `GPS_UART_RX` - praca bez modulu |
-| `GPS_UBLOX_M10` | autokonfiguracja M10: wykrycie predkosci UART, czestotliwosc, tryb automotive |
+| `GPX_LOG` | backup na SD: `/gpx/RRRR-MM-DD_GG-MM-SS.gpx` i `.ubx` (czas UTC pierwszego fixa) |
+| `GPS_UART_RX`, `GPS_UART_TX` | piny UART modulu GPS (tylko u-blox M10); bez `GPS_UART_RX` - praca bez modulu |
 | `GPS_UART_BAUD` | docelowa predkosc UART modulu |
 | `GPS_MODE` | domyslny tryb GPS (zmiana na stronie WiFi): `25` - 25 Hz, sam GPS; `20` - 20 Hz, GPS+Galileo; `10` - 10 Hz, GPS+Galileo+BeiDou (QZSS zawsze wylaczony - w Europie niewidoczny) |
 | `SIM_GPS` | symulowany GPS (kolo ~20 s, 10 Hz) zamiast modulu - nie razem z `GPS_UART_RX` |
 | `OTA_WIFI` | wgrywanie przez WiFi: siec `RC-CYD-OTA` przez 30 s po starcie (patrz nizej) |
-| `GPS_DEBUG`, `RC_DEBUG_VALUES`, `RC_DEBUG_STATS`, `SIM_DEBUG` | diagnostyka na porcie szeregowym |
+| `RC_DEBUG_VALUES`, `RC_DEBUG_STATS`, `SIM_DEBUG` | diagnostyka na porcie szeregowym |
 
-Modul jest konfigurowany przy kazdym starcie (tylko RAM modulu). Jesli przestanie wysylac
-poprawne dane albo jego czestotliwosc spadnie (np. reset po chwilowym braku zasilania),
-konfiguracja odbywa sie od nowa. Gdy modul nie odpowiada na komendy (przewod IO22 -> RX modulu),
-urzadzenie pracuje na jego wlasnych ustawieniach i co 30 s ponawia konfiguracje.
+Modul jest konfigurowany przy kazdym starcie (tylko RAM modulu): wykrycie predkosci UART,
+czestotliwosc i systemy wg trybu GPS, tryb automotive, sam protokol UBX (NMEA wylaczone).
+Jesli przestanie wysylac dane albo znow nadaje NMEA (reset do ustawien fabrycznych, np. po
+chwilowym braku zasilania), konfiguracja odbywa sie od nowa. Gdy modul nie odpowiada na komendy
+(przewod IO22 -> RX modulu), nie ma pozycji - w logu jest ostrzezenie, proba co 10 s.
+
+Plik `.ubx` to surowe ramki z modulu, do analizy po jezdzie (np. u-center, PyGPSClient, pyubx2):
+
+| Komunikat | Jak czesto | Co zawiera |
+|---|---|---|
+| NAV-PVT | kazda epoka | czas, pozycja, predkosc, kurs, satelity w rozwiazaniu, szacowany blad pozycji i predkosci |
+| NAV-DOP | kazda epoka | HDOP, VDOP i pozostale DOP |
+| NAV-SAT | 1 s | kazdy satelita: sila sygnalu C/N0, wysokosc, azymut, czy uzyty, residuum |
+| NAV-STATUS | 1 s | stan fixa, TTFF, czas pracy modulu, detektor spoofingu |
+| MON-RF | 1 s | szum, AGC, detektor zaklocen, zaklocenia waskopasmowe, stan anteny |
+| MON-SPAN | 1 s | widmo pasma L1 (256 punktow) - gdzie siedzi zaklocenie |
+| MON-COMMS | 1 s | zajetosc bufora nadawczego UART modulu (czy nie przepada czesc danych) |
+
+Przy 25 Hz to ok. 4 kB/s (ok. 15 MB na godzine jazdy). Przepelnienie bufora nadawczego modulu
+trafia do logu (`[GPS] UWAGA: bufor nadawczy modulu sie przepelnia`).
 
 ## Budowanie
 
@@ -87,12 +107,13 @@ Strona `http://192.168.4.1` pozwala ustawic nazwe Bluetooth (widoczna w RaceChro
 programu; po zapisie wyswietlacz sie restartuje. Pozostale strony:
 
 - `/files` - pliki z karty SD (`/gpx`): pobieranie, usuwanie pojedynczo albo wszystkich poza
-  biezacym zapisem. Podczas pobierania ekran stoi (strony i ekran obsluguje ta sama petla).
+  biezacym zapisem. Plikow biezacej sesji (`zapis trwa`) nie da sie pobrac - pobieranie pliku,
+  do ktorego wlasnie trafiaja dane, zawiesilo wyswietlacz; pobierzesz je po nastepnym wlaczeniu.
+  Podczas pobierania ekran stoi (strony i ekran obsluguje ta sama petla).
 - `/gps` - diagnostyka GPS, odswiezana co sekunde: rzeczywista liczba epok na sekunde i zgubione
   epoki (z czasu w danych modulu), pozycje wyslane do RaceChrono i nieudane wysylki, czas do
   pierwszego fixa, satelity z sila sygnalu (C/N0), szum i AGC wejscia radiowego. Przyciski testu
   zaklocen: ekran albo zapis SD wylaczone na 20 s - wykres pokazuje, czy sygnal sie zmienia.
-  Dodatkowe dane z modulu (UBX) plyna tylko przy otwartej stronie.
 
 1. Wlacz wyswietlacz i w ciagu 30 s podlacz laptop albo telefon do sieci `RC-CYD-OTA`.
 2. Wgraj program jednym ze sposobow:
@@ -106,6 +127,12 @@ programu; po zapisie wyswietlacz sie restartuje. Pozostale strony:
 Na czas wgrywania CYD zatrzymuje GPS i zapis na SD (domyka pliki) - zwalnia to ok. 27 kB RAM,
 bez czego wgrywanie przy wszystkim wlaczonym potrafilo sie przerwac. Gdy wgrywanie sie nie
 uda, CYD sam sie restartuje i wraca do normalnej pracy.
+
+Obudowa jest zaklejona, wiec WiFi to jedyna droga wgrywania. Dlatego nowo wgrany program jest
+zatwierdzany dopiero po 20 s pracy z dzialajacym WiFi (w logu `[OTA] nowy program zatwierdzony`).
+Restart wczesniej - awaria, zawieszenie, ale tez wylaczenie zasilania - albo WiFi, ktore nie
+wystartowalo, i bootloader sam wraca do poprzedniego programu (na stronie Stan: "Ostatnie wgranie
+... nie przeszedl proby"). Po wgraniu odczekaj wiec 20 s przed wylaczeniem.
 
 Haslo sieci i wgrywania: `12345678` (sekcja `[ota]` w `platformio.ini`). Pierwsze wgranie po przejsciu na
 dwie partycje aplikacji (`min_spiffs.csv`) musi byc przez USB (srodowisko `cyd`). Jesli wgrywanie
@@ -132,8 +159,10 @@ Log jest w pamieci RTC, wiec przetrwa restart po bledzie (i widac, co dzialo sie
 znika po odlaczeniu zasilania.
 
 Gdy dwa uruchomienia z rzedu skoncza sie bledem (panic, watchdog, spadek napiecia) w ciagu 20 s
-od startu, nastepne startuje w trybie awaryjnym: bez zapisu na SD (czerwone `SD`), reszta dziala
-i WiFi jest dostepne. Wylaczenie i wlaczenie zasilania albo wgranie programu probuje od nowa.
+od startu, nastepne startuje w trybie awaryjnym: dziala tylko ekran (na srodku paska czerwone
+`TRYB AWARYJNY`) i WiFi, ktore czeka na podlaczenie do 15 min - bez GPS, Bluetooth i zapisu na SD,
+zeby zawsze dalo sie wgrac poprawke. Wylaczenie i wlaczenie zasilania albo wgranie programu probuje
+od nowa.
 
 Czcionki w `include/fonts_saira.h` generuje `tools/make_fonts.py` (wymaga Pillow) z czcionki
 Saira (SIL Open Font License 1.1).

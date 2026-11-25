@@ -31,9 +31,10 @@ struct DashData {
   int8_t gpsState;  // gpsrx::State: 0 brak modulu, 1 brak danych, 2 brak fixa, 3 fix
   uint8_t gpsSats;      // satelity uzyte w rozwiazaniu (przed fixem zwykle 0-3)
   int16_t gpsHdopX10;   // 0 = brak
-  int16_t gpsAccX10;    // szacowany blad pozycji [m * 10] z GST, 0 = brak
+  int16_t gpsAccX10;    // szacowany blad pozycji [m * 10] (NAV-PVT hAcc), 0 = brak
   int8_t sdState;   // gpx::State: 0 wylaczone, -1 blad, 1 czeka na fix, 2 zapis
   int8_t otaState;  // ota::State: 0 WiFi wylaczone, 1 czeka na podlaczenie, 2 ktos podlaczony
+  bool safeMode;    // tryb awaryjny: tylko ekran i WiFi (SysLog)
 };
 
 namespace dash {

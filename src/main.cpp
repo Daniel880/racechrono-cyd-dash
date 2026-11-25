@@ -42,6 +42,7 @@ static void readValues(DashData& d) {
   d.gpsAccX10 = (int16_t)lroundf(min(q.accM, 99.9f) * 10.0f);
   d.sdState = (int8_t)gpx::state();
   d.otaState = (int8_t)ota::state();
+  d.safeMode = syslog::safeMode();
 }
 
 // Pozycja z modulu GPS (lub symulatora): do RaceChrono i do kolejki zapisu na SD.
@@ -106,15 +107,21 @@ void setup() {
 
   // nazwa Bluetooth i tryb GPS - ustawiane na stronie WiFi, zapisane w pamieci NVS
   const settings::Settings cfg = settings::load();
-  rc::begin(cfg.btName);
-  logHeap("Bluetooth");
+  // Tryb awaryjny (awarie tuz po starcie): tylko ekran i WiFi. Obudowa jest zaklejona, wiec WiFi
+  // to jedyna droga wgrania poprawki - nic, co mogloby sie wywracac, nie moze jej zablokowac.
+  const bool safe = syslog::safeMode();
+  if (!safe) {
+    rc::begin(cfg.btName);
+    logHeap("Bluetooth");
+  }
   // WiFi do wgrywania tylko przez chwile po starcie (tylko z -DOTA_WIFI), potem wylaczone.
   // Przed karta SD: przy braku RAM-u start WiFi konczy sie bledem programu, a karta SD
   // tylko stanem Error (i probuje znowu, gdy WiFi sie wylaczy i zwolni pamiec).
   ota::begin(dash::showOtaProgress, enterUpdateMode);
   logHeap("WiFi");
-  gpx::begin(!syslog::safeMode());  // backup na SD we wlasnym zadaniu (tylko z -DGPX_LOG)
+  gpx::begin(!safe);  // backup na SD we wlasnym zadaniu (tylko z -DGPX_LOG)
   logHeap("karcie SD");
+  if (safe) return;
   gpsrx::begin(cfg.gpsMode);  // modul GPS na UART (tylko z -DGPS_UART_RX)
 
 #ifdef SIM_GPS
@@ -140,7 +147,7 @@ void loop() {
                  (unsigned)ESP.getMinFreeHeap());
   }
   ota::loop();
-  rc::loop();
+  if (!syslog::safeMode()) rc::loop();  // w trybie awaryjnym Bluetooth nie jest uruchomiony
 
   static uint32_t lastDraw = 0;
   if (millis() - lastDraw < kRefreshMs) {
