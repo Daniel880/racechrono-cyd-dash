@@ -43,12 +43,13 @@ Pasek stanu - lewo: karta SD i WiFi; srodek: predkosc albo stan RaceChrono; praw
   jest podlaczony.
 - Srodek: predkosc z RaceChrono; bez polaczenia `brak RC`, w trakcie rejestracji `RC...`,
   czerwone `TRYB AWARYJNY` (patrz Log i tryb awaryjny).
-- Prawy rog - GPS, np. `14 1.2m 42dB` (przed fixem `3 szuka 38dB`, bez danych z modulu szare
-  `brak GPS`):
-  - liczba (biala) - satelity w rozwiazaniu, przed fixem zwykle 0-3,
-  - blad pozycji szacowany przez odbiornik (zielony < 2.5 m, zolty < 5 m, czerwony >= 5 m), przed
-    fixem zolte `szuka`. To lepszy wskaznik niz HDOP: odbiornik liczy go z jakosci pomiarow, nie
-    tylko z geometrii satelitow, wiec widac w nim tez slaby sygnal i odbicia,
+- Prawy rog - GPS, z fixem np. `14 1.2m 42dB`, przed fixem `0/7 14dB`, bez danych z modulu szare
+  `brak GPS`:
+  - z fixem: satelity w rozwiazaniu (biale); przed fixem zolte uzyte / slyszane - slyszane to
+    satelity z jakimkolwiek sygnalem, rosnie w trakcie szukania,
+  - z fixem: blad pozycji szacowany przez odbiornik (zielony < 2.5 m, zolty < 5 m, czerwony >= 5 m).
+    To lepszy wskaznik niz HDOP: odbiornik liczy go z jakosci pomiarow, nie tylko z geometrii
+    satelitow, wiec widac w nim tez slaby sygnal i odbicia,
   - sila sygnalu - srednia 4 najmocniejszych satelitow (zielona od 40 dB, zolta od 30, czerwona
     ponizej: dach, zasloniete niebo, zaklocenia); widac ja juz przed fixem.
 - `LAST` po przejechaniu mety przez 10 s: fioletowy - nowe najlepsze, zielony / czerwony -

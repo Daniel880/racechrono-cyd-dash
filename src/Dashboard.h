@@ -32,6 +32,7 @@ struct DashData {
   uint8_t gpsSats;      // satelity uzyte w rozwiazaniu (przed fixem zwykle 0-3)
   int16_t gpsAccX10;    // szacowany blad pozycji [m * 10] (NAV-PVT hAcc), 0 = brak
   uint8_t gpsCno;       // sila sygnalu 4 najmocniejszych satelitow [dBHz], 0 = brak
+  uint8_t gpsHeard;     // satelity z jakimkolwiek sygnalem, 0xFF = brak danych
   int8_t sdState;   // gpx::State: 0 wylaczone, -1 blad, 1 czeka na fix, 2 zapis
   int8_t otaState;  // ota::State: 0 WiFi wylaczone, 1 czeka na podlaczenie, 2 ktos podlaczony
   bool safeMode;    // tryb awaryjny: tylko ekran i WiFi (SysLog)

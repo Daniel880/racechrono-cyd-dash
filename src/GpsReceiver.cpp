@@ -51,6 +51,7 @@ float pvtAccM = 0.0f;    // hAcc: szacowany blad pozycji poziomej - z jakosci po
 float dopH = 0.0f, dopV = 0.0f;
 uint32_t dopMs = 0;
 uint8_t cnoTop4 = 0;  // srednia C/N0 4 najmocniejszych satelitow z ostatniego NAV-SAT (raz na sekunde)
+uint8_t satHeard = 0;  // satelity z jakimkolwiek sygnalem (C/N0 > 0) z ostatniego NAV-SAT
 uint32_t cnoMs = 0;
 constexpr uint32_t kCnoMaxAgeMs = 3000;
 rc::GpsFix pending{};     // pozycja z ostatniej epoki z fixem, czeka na update()
@@ -73,7 +74,7 @@ bool commsWarned = false;     // przepelnienie bufora nadawczego modulu juz zalo
 
 // Ekran (inne zadanie) dostaje stan i jakosc przez te kopie, odswiezane w kazdym update().
 volatile State stateSnap = State::NoData;
-volatile uint8_t qUsed = 0, qCno = 0;
+volatile uint8_t qUsed = 0, qCno = 0, qHeard = kNoHeard;
 volatile float qHdop = 0.0f, qAcc = 0.0f;
 
 uint16_t u16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -241,8 +242,10 @@ void handleUbx(uint8_t cls, uint8_t id, const uint8_t* p, uint16_t len) {
     // Sila sygnalu do ekranu: 4 najmocniejsze satelity (jak na stronie /gps) - widac ja juz przed
     // fixem, wiec wiadomo, czy antena widzi niebo.
     uint8_t top[4] = {0, 0, 0, 0};
+    uint8_t heard = 0;
     for (uint8_t i = 0; i < n; i++) {
       uint8_t c = p[8 + 12 * i + 2];
+      if (c) heard++;
       for (uint8_t k = 0; k < 4; k++)
         if (c > top[k]) {
           const uint8_t t = top[k];
@@ -258,6 +261,7 @@ void handleUbx(uint8_t cls, uint8_t id, const uint8_t* p, uint16_t len) {
         cnt++;
       }
     cnoTop4 = cnt ? (uint8_t)((sum + cnt / 2) / cnt) : 0;
+    satHeard = heard;
     cnoMs = millis() | 1;
     const uint8_t m = n < kMaxSats ? n : kMaxSats;
     portENTER_CRITICAL(&diagMux);
@@ -721,7 +725,9 @@ void publish() {
   const bool fix = s == State::Fix;
   qHdop = (fix && dopMs != 0 && now - dopMs <= kDopMaxAgeMs) ? dopH : 0.0f;
   qAcc = fix ? pvtAccM : 0.0f;
-  qCno = (s != State::NoData && cnoMs != 0 && now - cnoMs <= kCnoMaxAgeMs) ? cnoTop4 : 0;
+  const bool satFresh = s != State::NoData && cnoMs != 0 && now - cnoMs <= kCnoMaxAgeMs;
+  qCno = satFresh ? cnoTop4 : 0;
+  qHeard = satFresh ? satHeard : kNoHeard;
 }
 
 }  // namespace
@@ -748,7 +754,7 @@ bool update(rc::GpsFix& out) {
 
 State state() { return stateSnap; }
 
-Quality quality() { return Quality{qUsed, qHdop, qAcc, qCno}; }
+Quality quality() { return Quality{qUsed, qHdop, qAcc, qCno, qHeard}; }
 
 void stop() { Serial2.end(); }  // zwalnia sterownik UART (bufory) - przed wgrywaniem programu
 
@@ -774,7 +780,7 @@ namespace gpsrx {
 void begin(uint8_t) {}
 bool update(rc::GpsFix&) { return false; }
 State state() { return State::Off; }
-Quality quality() { return {}; }
+Quality quality() { return {0, 0.0f, 0.0f, 0, kNoHeard}; }
 void stop() {}
 void diag(Diag& out) {
   out = Diag{};

@@ -11,7 +11,8 @@
 
 // Uklad 240x320 (pionowo). Delty i czasy duze, rozmiar dopasowany do panelu:
 //  +--------------------------+
-//  | SD ~   145 km/h  14 1.2m 42dB |  0..23 SD, WiFi + predkosc + GPS (sat, blad, sygnal)
+//  | SD ~   145 km/h  14 1.2m 42dB |  0..23 SD, WiFi + predkosc + GPS (sat, blad, sygnal),
+//  |                               |        przed fixem "0/7 14dB" (uzyte/slyszane, sygnal)
 //  +--------------------------+
 //  |            +3            |  24..81   delta predkosci [km/h]
 //  | [=======|             ]  |           + pasek
@@ -169,21 +170,24 @@ void drawStatus(const DashData& d) {
       d.sdState == 2 ? COL_GREEN : (d.sdState == 1 ? COL_YELLOW : (d.sdState < 0 ? COL_RED : COL_DIM));
   const bool showSd = d.sdState != 0;
 
-  // Prawy rog - GPS, np. "14 1.2m 42dB": satelity w rozwiazaniu (bialy), szacowany blad pozycji
-  // (zielony < 2.5 m, zolty < 5 m, czerwony) - przed fixem zolte "szuka", i sila sygnalu
-  // 4 najmocniejszych satelitow (zielona od 40 dB, zolta od 30, czerwona ponizej) - widac, czy
-  // antena widzi niebo. Bez danych z modulu szare "brak GPS".
+  // Prawy rog - GPS. Fix, np. "14 1.2m 42dB": satelity w rozwiazaniu (bialy), szacowany blad
+  // pozycji (zielony < 2.5 m, zolty < 5 m, czerwony) i sila sygnalu 4 najmocniejszych satelitow
+  // (zielona od 40 dB, zolta od 30, czerwona ponizej) - widac, czy antena widzi niebo. Szukanie,
+  // np. "0/7 14dB": zolte uzyte / slyszane (z jakimkolwiek sygnalem) - rosnie w trakcie szukania,
+  // bez bledu pozycji. Bez danych z modulu szare "brak GPS".
   Seg seg[3] = {};
   if (d.gpsState == 1) {
     snprintf(seg[1].t, sizeof(seg[1].t), "brak GPS");
     seg[1].col = COL_LABEL;
   } else if (d.gpsState >= 2) {
-    snprintf(seg[0].t, sizeof(seg[0].t), "%u", d.gpsSats);
-    seg[0].col = COL_TEXT;
-    if (d.gpsState == 2) {
-      snprintf(seg[1].t, sizeof(seg[1].t), "szuka");
-      seg[1].col = COL_YELLOW;
-    } else if (d.gpsAccX10 > 0) {
+    if (d.gpsState == 2 && d.gpsHeard != 0xFF) {
+      snprintf(seg[0].t, sizeof(seg[0].t), "%u/%u", d.gpsSats, d.gpsHeard);
+      seg[0].col = COL_YELLOW;
+    } else {
+      snprintf(seg[0].t, sizeof(seg[0].t), "%u", d.gpsSats);
+      seg[0].col = d.gpsState == 2 ? COL_YELLOW : COL_TEXT;
+    }
+    if (d.gpsState == 3 && d.gpsAccX10 > 0) {
       const int a = d.gpsAccX10 > 999 ? 999 : d.gpsAccX10;
       snprintf(seg[1].t, sizeof(seg[1].t), "%d.%dm", a / 10, a % 10);
       seg[1].col = a < 25 ? COL_GREEN : (a < 50 ? COL_YELLOW : COL_RED);
