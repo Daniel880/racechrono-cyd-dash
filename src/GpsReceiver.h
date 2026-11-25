@@ -15,6 +15,7 @@ struct Quality {
   uint8_t used;  // satelity uzyte w rozwiazaniu (NAV-PVT numSV), 0 = brak danych
   float hdop;    // NAV-DOP, 0 = brak (bez fixa)
   float accM;    // szacowany blad pozycji poziomej [m] (NAV-PVT hAcc), 0 = brak (bez fixa)
+  uint8_t cno;   // srednia sila sygnalu 4 najmocniejszych satelitow [dBHz] (NAV-SAT), 0 = brak
 };
 
 // ---------- Diagnostyka (strona /gps) ----------

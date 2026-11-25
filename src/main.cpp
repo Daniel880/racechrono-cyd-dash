@@ -38,8 +38,8 @@ static void readValues(DashData& d) {
   d.gpsState = (int8_t)gpsrx::state();
   gpsrx::Quality q = gpsrx::quality();
   d.gpsSats = q.used;
-  d.gpsHdopX10 = (int16_t)lroundf(min(q.hdop, 99.9f) * 10.0f);
   d.gpsAccX10 = (int16_t)lroundf(min(q.accM, 99.9f) * 10.0f);
+  d.gpsCno = q.cno;
   d.sdState = (int8_t)gpx::state();
   d.otaState = (int8_t)ota::state();
   d.safeMode = syslog::safeMode();

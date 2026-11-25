@@ -11,7 +11,7 @@
 
 // Uklad 240x320 (pionowo). Delty i czasy duze, rozmiar dopasowany do panelu:
 //  +--------------------------+
-//  | o GPS SD 145 km/h 14 sat 0.8 |  0..23 status + predkosc + jakosc GPS (sat, HDOP)
+//  | SD ~   145 km/h  14 1.2m 42dB |  0..23 SD, WiFi + predkosc + GPS (sat, blad, sygnal)
 //  +--------------------------+
 //  |            +3            |  24..81   delta predkosci [km/h]
 //  | [=======|             ]  |           + pasek
@@ -57,7 +57,7 @@ LGFX_Sprite bigSpr;
 struct Panel {
   int16_t x, y, w, h;
   LGFX_Sprite* spr;
-  char key[80];  // co jest aktualnie narysowane
+  char key[96];  // co jest aktualnie narysowane
 };
 
 LGFX* lcd = nullptr;
@@ -126,7 +126,7 @@ int32_t clampI(int32_t v, int32_t lim) { return v > lim ? lim : (v < -lim ? -lim
 
 // Ikona WiFi (srodek dolu w x, y): zolte luki = siec czeka na podlaczenie,
 // pelny zielony wachlarz = ktos jest podlaczony (mozna wgrywac).
-constexpr int kWifiX = 79, kWifiY = 19, kWifiR = 13;
+constexpr int kWifiX = 37, kWifiY = 19, kWifiR = 13;
 void drawWifiIcon(LGFX_Sprite& s, bool client) {
   if (client) {
     s.fillArc(kWifiX, kWifiY, 0, kWifiR, 225, 315, COL_GREEN);
@@ -136,20 +136,26 @@ void drawWifiIcon(LGFX_Sprite& s, bool client) {
   for (int r : {5, 9, kWifiR}) s.fillArc(kWifiX, kWifiY, r - 1, r, 225, 315, COL_YELLOW);
 }
 
-void drawStatus(const DashData& d) {
-  uint16_t dot = !d.connected ? COL_DIM : (!d.configured ? COL_YELLOW : COL_GREEN);
+// Kawalek napisu GPS w prawym rogu - kazdy w swoim kolorze.
+struct Seg {
+  char t[12];
+  uint16_t col;
+};
 
-  // srodek paska: predkosc, a gdy RC jeszcze nie gotowe - stan polaczenia
+// Pasek stanu: lewo SD i WiFi; srodek predkosc albo stan RaceChrono; prawo caly stan GPS.
+// Nic nie jest obcinane - srodkowy napis przesuwa sie, gdy zaslanialby lewa albo prawa strone.
+void drawStatus(const DashData& d) {
+  // srodek: predkosc, a gdy RC jeszcze nie gotowe - krotki stan (miejsce dla GPS po prawej)
   char mid[16];
   uint16_t midCol = COL_TEXT;
   if (d.safeMode) {
     snprintf(mid, sizeof(mid), "TRYB AWARYJNY");
     midCol = COL_RED;
   } else if (!d.connected) {
-    snprintf(mid, sizeof(mid), "Czekam na RC");
+    snprintf(mid, sizeof(mid), "brak RC");
     midCol = COL_LABEL;
   } else if (!d.configured) {
-    snprintf(mid, sizeof(mid), "Konfiguracja");
+    snprintf(mid, sizeof(mid), "RC...");
     midCol = COL_LABEL;
   } else if (d.hasSpeed) {
     snprintf(mid, sizeof(mid), "%ld km/h", (long)((d.speedKmhX10 + 5) / 10));
@@ -158,72 +164,78 @@ void drawStatus(const DashData& d) {
     midCol = COL_DIM;
   }
 
-  // Wskazniki: GPS (szary brak modulu/danych, zolty brak fixa, zielony fix),
-  //             SD (szary wylaczone, czerwony blad, zolty czeka na fix, zielony zapis)
-  uint16_t gpsCol = d.gpsState == 3 ? COL_GREEN : (d.gpsState == 2 ? COL_YELLOW : COL_DIM);
-  uint16_t sdCol = d.sdState == 2 ? COL_GREEN : (d.sdState == 1 ? COL_YELLOW : (d.sdState < 0 ? COL_RED : COL_DIM));
-  bool showGps = d.gpsState != 0;
-  bool showSd = d.sdState != 0;
+  // SD: szary wylaczone, czerwony blad, zolty czeka na fix, zielony zapis
+  const uint16_t sdCol =
+      d.sdState == 2 ? COL_GREEN : (d.sdState == 1 ? COL_YELLOW : (d.sdState < 0 ? COL_RED : COL_DIM));
+  const bool showSd = d.sdState != 0;
 
-  // Prawy rog: satelity uzyte w rozwiazaniu. Przed fixem szare (zwykle 0-3), z fixem + szacowany
-  // blad pozycji z NAV-PVT (kolor: zielony < 2.5 m, zolty < 5 m, czerwony); bez niego - HDOP.
-  char gq[16] = "";
-  char gqShort[8] = "";
-  uint16_t gqCol = COL_LABEL;
-  if (d.gpsState == 2) {
-    snprintf(gq, sizeof(gq), "%u sat", d.gpsSats);
-  } else if (d.gpsState == 3 && d.gpsAccX10 > 0) {
-    const int a = d.gpsAccX10 > 999 ? 999 : d.gpsAccX10;
-    snprintf(gqShort, sizeof(gqShort), "%d.%dm", a / 10, a % 10);  // gdy brak miejsca - sam blad
-    snprintf(gq, sizeof(gq), "%u sat %s", d.gpsSats, gqShort);
-    gqCol = a < 25 ? COL_GREEN : (a < 50 ? COL_YELLOW : COL_RED);
-  } else if (d.gpsState == 3) {
-    snprintf(gqShort, sizeof(gqShort), "%u sat", d.gpsSats);
-    if (d.gpsHdopX10 > 0)
-      snprintf(gq, sizeof(gq), "%u sat %d.%d", d.gpsSats, d.gpsHdopX10 / 10, d.gpsHdopX10 % 10);
-    else
-      snprintf(gq, sizeof(gq), "%s", gqShort);
-    bool bad = d.gpsSats < 6 || d.gpsHdopX10 == 0 || d.gpsHdopX10 > 25;
-    bool good = d.gpsSats >= 10 && d.gpsHdopX10 > 0 && d.gpsHdopX10 <= 12;
-    gqCol = good ? COL_GREEN : (bad ? COL_RED : COL_YELLOW);
+  // Prawy rog - GPS, np. "14 1.2m 42dB": satelity w rozwiazaniu (bialy), szacowany blad pozycji
+  // (zielony < 2.5 m, zolty < 5 m, czerwony) - przed fixem zolte "szuka", i sila sygnalu
+  // 4 najmocniejszych satelitow (zielona od 40 dB, zolta od 30, czerwona ponizej) - widac, czy
+  // antena widzi niebo. Bez danych z modulu szare "brak GPS".
+  Seg seg[3] = {};
+  if (d.gpsState == 1) {
+    snprintf(seg[1].t, sizeof(seg[1].t), "brak GPS");
+    seg[1].col = COL_LABEL;
+  } else if (d.gpsState >= 2) {
+    snprintf(seg[0].t, sizeof(seg[0].t), "%u", d.gpsSats);
+    seg[0].col = COL_TEXT;
+    if (d.gpsState == 2) {
+      snprintf(seg[1].t, sizeof(seg[1].t), "szuka");
+      seg[1].col = COL_YELLOW;
+    } else if (d.gpsAccX10 > 0) {
+      const int a = d.gpsAccX10 > 999 ? 999 : d.gpsAccX10;
+      snprintf(seg[1].t, sizeof(seg[1].t), "%d.%dm", a / 10, a % 10);
+      seg[1].col = a < 25 ? COL_GREEN : (a < 50 ? COL_YELLOW : COL_RED);
+    }
+    if (d.gpsCno) {
+      snprintf(seg[2].t, sizeof(seg[2].t), "%udB", d.gpsCno);
+      seg[2].col = d.gpsCno >= 40 ? COL_GREEN : (d.gpsCno >= 30 ? COL_YELLOW : COL_RED);
+    }
   }
 
-  char key[80];
-  snprintf(key, sizeof(key), "%u|%s|%u|%u|%u|%d%d|%s|%u|%d", (unsigned)dot, mid, (unsigned)midCol,
-           (unsigned)gpsCol, (unsigned)sdCol, showGps, showSd, gq, (unsigned)gqCol, d.otaState);
+  char key[96];
+  snprintf(key, sizeof(key), "%d|%d|%u|%u|%u|%u|%u|%s|%s %s %s", d.otaState, showSd, (unsigned)sdCol,
+           (unsigned)midCol, (unsigned)seg[0].col, (unsigned)seg[1].col, (unsigned)seg[2].col, mid, seg[0].t,
+           seg[1].t, seg[2].t);
   if (!changed(pStatus, key)) return;
 
   auto& s = *pStatus.spr;
   s.fillScreen(COL_BG);
-  s.fillCircle(8, 12, 5, dot);
   s.setFont(&fonts::Font2);
   s.setTextDatum(middle_left);
-  if (showGps) {
-    s.setTextColor(gpsCol);
-    s.drawString("GPS", 20, 12);
-  }
+  int leftEnd = 0;  // prawa krawedz tego, co po lewej
   if (showSd) {
     s.setTextColor(sdCol);
-    s.drawString("SD", 50, 12);
+    s.drawString("SD", 4, 12);
+    leftEnd = 4 + s.textWidth("SD");
   }
-  int midX = 126;
   if (d.otaState > 0) {
     drawWifiIcon(s, d.otaState >= 2);
-    // srodkowy napis przesuniety w prawo, gdy wchodzilby na ikone
-    const int minX = kWifiX + kWifiR + 4 + s.textWidth(mid) / 2;
-    if (midX < minX) midX = minX;
+    leftEnd = kWifiX + kWifiR;
   }
+  // GPS do prawej krawedzi: kawalki ze spacja miedzy niepustymi
+  const int space = s.textWidth(" ");
+  int total = 0;
+  for (const Seg& g : seg)
+    if (g.t[0]) total += (total ? space : 0) + s.textWidth(g.t);
+  const int rightStart = 236 - total;  // lewa krawedz napisu GPS
+  int x = rightStart;
+  for (const Seg& g : seg) {
+    if (!g.t[0]) continue;
+    if (x > rightStart) x += space;
+    s.setTextColor(g.col);
+    s.drawString(g.t, x, 12);
+    x += s.textWidth(g.t);
+  }
+  // srodek ekranu, chyba ze napis wchodzilby na lewa albo prawa strone
+  const int half = s.textWidth(mid) / 2;
+  int midX = 120;
+  if (midX + half > rightStart - 6) midX = rightStart - 6 - half;
+  if (midX - half < leftEnd + 6) midX = leftEnd + 6 + half;
   s.setTextColor(midCol);
   s.setTextDatum(middle_center);
   s.drawString(mid, midX, 12);
-  if (gq[0]) {
-    // gdy pelny napis wchodzilby na srodkowy tekst - bez HDOP
-    const int midRight = midX + s.textWidth(mid) / 2;
-    const char* txt = (236 - s.textWidth(gq) < midRight + 6 && gqShort[0]) ? gqShort : gq;
-    s.setTextColor(gqCol);
-    s.setTextDatum(middle_right);
-    s.drawString(txt, 236, 12);
-  }
   push(pStatus);
 }
 

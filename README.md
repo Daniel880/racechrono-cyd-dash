@@ -22,7 +22,7 @@ w `include/LGFX_CYD.h`.
 ## Ekran
 
 ```
-| o GPS SD   145 km/h   14 sat 0.8 |  pasek stanu
+| SD ~      145 km/h  14 1.2m 42dB |  pasek stanu
 |               +3                 |  delta predkosci [km/h] + pasek (zielony = szybciej)
 |             -0.23                |  delta czasu [s] + pasek
 | CURRENT #12            1:23.45   |  biezace okrazenie
@@ -35,16 +35,22 @@ z dopiskiem `+zmiany`, gdy program zbudowano z niezacommitowanych zmian) i data 
 wersja jest na stronie Stan i w logu (`[SYS] start, program ...`). Wersje wpisuje `tools/version.py`
 przy kazdej kompilacji.
 
-- Kropka: szara - brak polaczenia z RaceChrono, zolta - rejestracja monitorow, zielona - gotowe.
-- `GPS`: szary - brak poprawnych danych z modulu, zolty - brak fixa, zielony - fix.
+Pasek stanu - lewo: karta SD i WiFi; srodek: predkosc albo stan RaceChrono; prawo: GPS.
+
 - `SD`: czerwony - brak karty albo blad zapisu (ponowna proba co 5 s) albo tryb awaryjny
   (patrz Log i tryb awaryjny), zolty - czeka na fix, zielony - zapis.
 - Ikona WiFi (obok `SD`): zolte luki - siec WiFi czeka na podlaczenie, zielony wachlarz - ktos
   jest podlaczony.
-- Prawy rog: satelity uzyte w rozwiazaniu (przed fixem szare, zwykle 0-3), z fixem dodatkowo
-  szacowany blad pozycji, np. `18 sat 1.2m` (zielony < 2.5 m, zolty < 5 m, czerwony >= 5 m).
-  To lepszy wskaznik niz HDOP: odbiornik liczy go z jakosci pomiarow, nie tylko z geometrii
-  satelitow, wiec widac w nim tez slaby sygnal i odbicia.
+- Srodek: predkosc z RaceChrono; bez polaczenia `brak RC`, w trakcie rejestracji `RC...`,
+  czerwone `TRYB AWARYJNY` (patrz Log i tryb awaryjny).
+- Prawy rog - GPS, np. `14 1.2m 42dB` (przed fixem `3 szuka 38dB`, bez danych z modulu szare
+  `brak GPS`):
+  - liczba (biala) - satelity w rozwiazaniu, przed fixem zwykle 0-3,
+  - blad pozycji szacowany przez odbiornik (zielony < 2.5 m, zolty < 5 m, czerwony >= 5 m), przed
+    fixem zolte `szuka`. To lepszy wskaznik niz HDOP: odbiornik liczy go z jakosci pomiarow, nie
+    tylko z geometrii satelitow, wiec widac w nim tez slaby sygnal i odbicia,
+  - sila sygnalu - srednia 4 najmocniejszych satelitow (zielona od 40 dB, zolta od 30, czerwona
+    ponizej: dach, zasloniete niebo, zaklocenia); widac ja juz przed fixem.
 - `LAST` po przejechaniu mety przez 10 s: fioletowy - nowe najlepsze, zielony / czerwony -
   szybciej / wolniej niz okrazenie porownawcze.
 - Dolny wiersz: `BEST` (fiolet) albo `REF` (zolty), gdy w RaceChrono wybrano inne okrazenie
@@ -171,7 +177,7 @@ Saira (SIL Open Font License 1.1).
 
 Urzadzenie rozglasza sie przez BLE jako `RC DIY CYD` (nazwe mozna zmienic na stronie WiFi;
 RaceChrono rozpoznaje urzadzenie po usludze BLE, nie po nazwie). Po polaczeniu z RaceChrono samo rejestruje
-potrzebne monitory (kropka na pasku stanu robi sie zielona). Zeby RaceChrono korzystalo z pozycji
+potrzebne monitory (na srodku paska stanu `brak RC` -> `RC...` -> predkosc). Zeby RaceChrono korzystalo z pozycji
 z modulu GPS, wybierz to urzadzenie w RaceChrono jako zrodlo GPS.
 
 ## Obudowa
